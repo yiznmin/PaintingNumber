@@ -16,11 +16,12 @@ random_state = None
 
 class PbnGen:
     def __init__(
-        self, f_name, num_colors=None, min_num_colors=10, pruningThreshold=6.25e-5
+        self, f_name, num_colors=None, min_num_colors=10, pruningThreshold=6.25e-5, fixed_palette=None, suggestion_threshold=40
     ):
-        bgr_image = cv2.imread(f_name)
+        # 支援直接傳入影像矩陣或檔案路徑
+        bgr_image = cv2.imread(f_name) if isinstance(f_name, str) else f_name
         # change to RGB
-        rgbImage = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        rgbImage = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB) if bgr_image is not None else np.zeros((100,100,3), dtype=np.uint8)
 
         # Retain an original image copy for easy testing
         self.originalImage = rgbImage
@@ -34,6 +35,11 @@ class PbnGen:
 
         # This will contain a dict of colors and binary masks of the pruned clusters
         self.prunableClusters = None
+
+        # Business Logic: Fixed Palette and Suggestions
+        self.fixed_palette = np.array(fixed_palette) if fixed_palette is not None else None
+        self.suggestion_threshold = suggestion_threshold
+        self.color_suggestions = []
 
         self.num_colors = num_colors if num_colors else self.get_num_clusters()
         # make sure number of colors is at least minimum number
@@ -61,8 +67,41 @@ class PbnGen:
         )
         model.fit(self.img1d)
 
-        # get primary colors as floats from 0 to 1
-        self.palette = model.cluster_centers_ / 255
+        centers = model.cluster_centers_
+        snapped_centers = []
+        self.color_suggestions = []
+
+        if self.fixed_palette is not None:
+            # 將 K-Means 中心和固定色盤都轉換到 LAB 空間再計算距離
+            # LAB 距離更符合人眼感知，避免 RGB 空間的非線性誤差
+            def rgb_to_lab(rgb_array):
+                # rgb_array shape: (N, 3)，值域 0-255
+                rgb_u8 = rgb_array.astype(np.uint8).reshape(-1, 1, 3)
+                lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+                return lab
+
+            centers_lab = rgb_to_lab(centers)
+            palette_lab = rgb_to_lab(self.fixed_palette)
+
+            for i, center in enumerate(centers):
+                # LAB 空間計算歐氏距離
+                distances = np.linalg.norm(palette_lab - centers_lab[i], axis=1)
+                min_dist_idx = np.argmin(distances)
+                min_dist = float(distances[min_dist_idx])
+                nearest_fixed_color = self.fixed_palette[min_dist_idx]
+
+                if min_dist > self.suggestion_threshold:
+                    self.color_suggestions.append({
+                        "ideal_rgb": center.astype(int).tolist(),
+                        "nearest_fixed_rgb": nearest_fixed_color.tolist(),
+                        "distance": min_dist
+                    })
+
+                snapped_centers.append(nearest_fixed_color)
+            self.palette = np.array(snapped_centers) / 255
+        else:
+            self.palette = centers / 255
+
         self.labels = model.labels_
         # get quantized image
         q_img = self.palette[self.labels].reshape(self.image.shape)
@@ -76,6 +115,9 @@ class PbnGen:
         colors, labels, q_img = self.cluster_colors()
         q_img = (q_img * 255).astype(np.uint8)
         # print(q_img.dtype)
+
+        if self.color_suggestions:
+            print(f"⚠️ 提醒：發現 {len(self.color_suggestions)} 個區域色差較大，建議增加色系：", self.color_suggestions)
 
         self.setImage(q_img.copy())
 
@@ -798,16 +840,20 @@ class PbnGen:
 
         return boundaryImage
 
-    def set_final_pbn(self):
+    def set_final_pbn(self, blur_ksize=21, blur_sigma_color=21, blur_sigma_space=14, prune_iterations=6):
         """
-        Runs all necessary functions to get the final paint by number image
-        and set the internal image representation to it.
+        Runs all necessary functions to get the final paint by number image.
+        細緻度由外部參數控制：
+          blur_ksize/sigma: 越大越模糊（色塊越大越簡單）
+          prune_iterations: 越多小色塊越少（越簡單）
+          pruningThreshold 在 __init__ 設定
         """
         originalDims = self.getImage().shape[:-1]
-        self.blurImage_(blurType="bilateral", ksize=21, sigmaColor=21, sigmaSpace=14)
+        self.blurImage_(blurType="bilateral", ksize=blur_ksize,
+                        sigmaColor=blur_sigma_color, sigmaSpace=blur_sigma_space)
         self.resizeImage_(0.5)
         self.cluster_colors_()
-        self.pruneClustersSimple(iterations=6)
+        self.pruneClustersSimple(iterations=prune_iterations)
         self.resizeImage_(dimension=originalDims)
         # draw rectangle around image so border is recognized
         img = self.getImage()
@@ -815,71 +861,135 @@ class PbnGen:
         self.setImage(img)
 
     def output_to_svg(self, svg_path: str, output_palette_path: str = None):
-        """
-        Gets a boundary image between colors in a PBN template by running an edge filter on the provided image or self.image.
-        Upscaling the image before passing it to this function gives better resolution.
-
-        Arguments:
-            svg_path: File path to output the svg to.
-        Returns:
-            palette: A dictionary of all colors in the image each with an array
-            of unique html ids representing each shape. This will allow for javascript
-            manipulation of the color of each shape.
-        """
         h, w = self.getImage().shape[:2]
         dwg = svgwrite.Drawing(svg_path, profile="tiny", viewBox=(f"0 0 {w} {h}"))
         i = 0
-        palette = []
         color_masks = self.getUniqueColorsMasks()
 
+        # 收集所有輪廓，記錄面積
+        all_contours = []
         for idx, (color, mask) in enumerate(color_masks.items()):
-            mask[mask == False] = 0
-            mask[mask == True] = 1
-            boundary_img = self.getBoundaryImage(mask)
-
-            # plt.imshow(boundary_img, cmap="gray")
-            # plt.show()
-
-            contours, hierarchy = cv2.findContours(
-                boundary_img.astype(np.uint8),
+            mask_uint8 = np.all(mask, axis=2).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                mask_uint8,
                 cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_TC89_L1,
+                cv2.CHAIN_APPROX_TC89_KCOS,
             )
-
-            data = {}
-            color_str = str(color)
-            data["color"] = color_str
-            data["shapes"] = []
             for c in contours:
-                points = c.squeeze().tolist()
-                if len(c.squeeze().shape) == 1:
-                    points = [points]
+                area = cv2.contourArea(c)
+                all_contours.append((area, idx, color, c))
 
-                fill = "white"
-                # fill = "rgb" + str(color)
-                group = dwg.g(fill=fill, stroke="black", id=str(i))
-                shape = dwg.polygon(points)
+        # 面積大的先畫 → 小色塊後畫疊上去，不會被蓋掉
+        all_contours.sort(key=lambda x: x[0], reverse=True)
 
-                # add text label
-                text = self.add_text_label(dwg, c, str(idx))
+        # 建立這幅畫的 1~N 專屬編號（面積最大的顏色得 #1）
+        color_to_seq = {}
+        for _, idx, color, _ in all_contours:
+            key = tuple(int(v) for v in color)
+            if key not in color_to_seq:
+                color_to_seq[key] = len(color_to_seq) + 1
 
-                group.add(shape)
-                group.add(text)
-                dwg.add(group)
+        # 建立 JSON 對照表
+        palette_map = {}
+        for idx, (color, mask) in enumerate(color_masks.items()):
+            key = tuple(int(v) for v in color)
+            seq_num = color_to_seq.get(key, idx + 1)
+            
+            # 計算原始 60 色中的號碼 (Master ID)
+            master_id = "N/A"
+            if self.fixed_palette is not None:
+                # 尋找這個 RGB 在原始 60 色陣列中的索引
+                match = np.where((self.fixed_palette == color).all(axis=1))[0]
+                if len(match) > 0:
+                    master_id = int(match[0] + 1)
 
-                data["shapes"].append(str(i))
-                i += 1
+            palette_map[idx] = {
+                "template_id": seq_num,
+                "master_id": master_id,
+                "rgb": [int(c) for c in color],
+                "shapes": []
+            }
+        palette = list(palette_map.values())
 
-            palette.append(data)
+        for area, idx, color, c in all_contours:
+            points = c.squeeze().tolist()
+            if len(c.squeeze().shape) == 1:
+                points = [points]
+
+            color_fill = "rgb({},{},{})".format(int(color[0]), int(color[1]), int(color[2]))
+            group = dwg.g(id=str(i))
+
+            # 第一層：白色不透明底 + 1px 黑色邊線
+            group.add(dwg.polygon(points, fill="white", stroke="black", stroke_width="1"))
+            # 第二層：25% 透明提示色，不加邊線
+            group.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
+
+            # 數字標籤
+            key = tuple(int(v) for v in color)
+            label = str(color_to_seq.get(key, idx + 1))
+            text = self.add_text_label(dwg, c, label)
+            group.add(text)
+            dwg.add(group)
+
+            palette[idx]["shapes"].append(str(i))
+            i += 1
 
         dwg.save()
         print(f"{i} shapes")
 
         if output_palette_path:
-            with open(output_palette_path, "w") as outfile:
-                json.dump(palette, outfile)
+            with open(output_palette_path, "w", encoding="utf-8") as outfile:
+                json.dump(palette, outfile, ensure_ascii=False, indent=2)
 
         return palette
+
+    def output_filled_image(self, output_path: str, scale: int = 2, border: bool = False):
+        """
+        輸出填色完成效果圖：與 SVG 使用完全相同的輪廓和顏色，完整不透明填色，不含數字。
+        scale:  超採樣倍率（預設 2），數值越大邊緣越平滑。
+        border: 是否顯示黑色輪廓線（預設 False）。
+        """
+        h, w = self.getImage().shape[:2]
+        sh, sw = h * scale, w * scale
+        canvas = np.ones((sh, sw, 3), dtype=np.uint8) * 255
+
+        color_masks = self.getUniqueColorsMasks()
+
+        all_contours = []
+        min_area = 4  # 過濾掉面積太小的輪廓，避免虛線殘影
+        for color, mask in color_masks.items():
+            mask_uint8 = np.all(mask, axis=2).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(
+                mask_uint8,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,  # TC89_KCOS 對細薄區域會產生虛線，改用 SIMPLE
+            )
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area >= min_area:
+                    all_contours.append((area, color, c))
+
+        all_contours.sort(key=lambda x: x[0], reverse=True)
+
+        for _, color, c in all_contours:
+            bgr_color = (int(color[2]), int(color[1]), int(color[0]))
+            c_scaled = (c * scale).astype(np.int32)
+            cv2.drawContours(canvas, [c_scaled], -1, bgr_color, thickness=cv2.FILLED, lineType=cv2.LINE_AA)
+
+        if border:
+            for _, color, c in all_contours:
+                c_scaled = (c * scale).astype(np.int32)
+                cv2.drawContours(canvas, [c_scaled], -1, (0, 0, 0), thickness=scale, lineType=cv2.LINE_AA)
+
+        result = cv2.resize(canvas, (w, h), interpolation=cv2.INTER_AREA)
+        # 用 imencode + 直接寫檔，避免 cv2.imwrite 在 Windows 中文路徑下靜默失敗
+        success, buf = cv2.imencode(".png", result)
+        if success:
+            with open(output_path, "wb") as f:
+                f.write(buf.tobytes())
+            print(f"填色效果圖已儲存至: {output_path}")
+        else:
+            print(f"❌ 填色效果圖編碼失敗: {output_path}")
 
     def point_inside_contour(self, point, contour):
         """Check if a point is inside a contour."""

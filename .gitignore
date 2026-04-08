@@ -1,3 +1,9 @@
+# 生成的輸出結果（可重新產生）
+output/
+
+# 來源圖片（通常較大或含版權）
+images/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
