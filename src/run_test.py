@@ -5,6 +5,19 @@ import json
 from datetime import datetime
 from pbn_gen import PbnGen
 
+IMAGES_SAM_DIR = r"D:\website\PaintLearn\paint-by-number\images_sam"
+
+def load_sam_mask(name):
+    """
+    若 images_sam/ 下有 <name>_mask.png 就載入並回傳遮罩，否則回傳 None。
+    """
+    mask_path = os.path.join(IMAGES_SAM_DIR, f"{name}_mask.png")
+    if os.path.exists(mask_path):
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        print(f"✅ 載入 SAM 遮罩：{mask_path}")
+        return mask
+    return None
+
 # 4 個難易度設定（細緻度由模糊強度、合併門檻、迭代次數控制）
 # num_colors 只是上限，實際顏色數由圖片內容決定
 DIFFICULTY_LEVELS = [
@@ -50,7 +63,7 @@ DIFFICULTY_LEVELS = [
 STATS_PATH = r"D:\website\PaintLearn\paint-by-number\output\color_stats.json"
 
 
-def run_single_level(input_image_path, level_dir, level, image_name, style_tags):
+def run_single_level(input_image_path, level_dir, level, image_name, style_tags, sam_mask=None, extra_colors=10):
     level_name = level["name"]
 
     print(f"\n{'='*40}")
@@ -69,6 +82,11 @@ def run_single_level(input_image_path, level_dir, level, image_name, style_tags)
         blur_sigma_space=level["blur_sigma_space"],
         prune_iterations=level["prune_iterations"],
     )
+
+    # 若有 SAM 遮罩，對選取區域做額外細化
+    if sam_mask is not None:
+        print(f"  → 套用 SAM 遮罩，細化區域 +{extra_colors} 色")
+        pbn.refine_region(sam_mask, extra_colors=extra_colors)
 
     svg_path    = os.path.join(level_dir, "template.svg")
     filled_path = os.path.join(level_dir, "filled.png")
@@ -102,8 +120,15 @@ def run_single_level(input_image_path, level_dir, level, image_name, style_tags)
             }
             for item in used_colors
         ],
+        "sam_used": sam_mask is not None,
+        "sam_extra_colors": extra_colors if sam_mask is not None else 0,
         "approved": False,   # 人工確認滿意後改為 True
-        "notes": ""          # 備註欄位
+        "notes": "",         # 備註：遇到的問題、調整過的參數
+        "workflow_hints": {  # 未來自動化參考
+            "color_issues": [],   # 例："牛皮紙變粉色 → 色盤缺暖棕"
+            "param_adjustments": [],  # 例："進階 blur 加大避免黑點"
+            "recommended_for_type": style_tags
+        }
     }
     summary_path = os.path.join(level_dir, "summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
@@ -154,16 +179,24 @@ def update_color_stats(summaries):
 
 
 def test_pbn_effect():
-    # 只需改這兩行
-    name       = "egg"
-    style_tags = ["食物", "暖色調"]   # 自由填寫風格標籤，用於累積分析
+    # 只需改這三行
+    name        = "My"
+    style_tags  = ["人像", "暖色調"]
+    extra_colors = 10  # SAM 遮罩區域額外增加的顏色數
 
+    # 若 images_sam/ 有圖就從那裡讀，否則從 images/ 讀
+    sam_img = os.path.join(IMAGES_SAM_DIR, f"{name}.jpg")
     images_dir = r"D:\website\PaintLearn\paint-by-number\images"
-    input_image_path = os.path.join(images_dir, f"{name}.jpg")
+    input_image_path = sam_img if os.path.exists(sam_img) else os.path.join(images_dir, f"{name}.jpg")
 
     if not os.path.exists(input_image_path):
-        print(f"❌ 找不到測試圖片: {input_image_path}")
+        print(f"❌ 找不到測試圖片: {name}.jpg")
         return
+
+    # 載入 SAM 遮罩（若有）
+    sam_mask = load_sam_mask(name)
+    if sam_mask is not None:
+        print(f"  SAM 模式：遮罩區域將額外細化 +{extra_colors} 色")
 
     base_output_dir = os.path.join(
         r"D:\website\PaintLearn\paint-by-number\output", name
@@ -174,7 +207,8 @@ def test_pbn_effect():
     for level in DIFFICULTY_LEVELS:
         level_dir = os.path.join(base_output_dir, level["name"])
         os.makedirs(level_dir, exist_ok=True)
-        summary = run_single_level(input_image_path, level_dir, level, name, style_tags)
+        summary = run_single_level(input_image_path, level_dir, level, name, style_tags,
+                                   sam_mask=sam_mask, extra_colors=extra_colors)
         summaries.append(summary)
 
     # 更新跨圖片顏色統計

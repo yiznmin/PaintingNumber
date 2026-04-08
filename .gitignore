@@ -4,6 +4,12 @@ output/
 # 來源圖片（通常較大或含版權）
 images/
 
+# SAM 模型權重（太大，不上傳）
+models/
+
+# SAM 來源圖片（含版權），只上傳遮罩和點選記錄
+images_sam/*.jpg
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

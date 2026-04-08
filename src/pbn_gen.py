@@ -803,7 +803,7 @@ class PbnGen:
                     np.abs(self.image - image)
                 ), plt.title("Diff"), plt.show()
 
-            self.setImage(image)
+            self.setImage(image.astype(np.uint8))
 
         print("\nDone!")
 
@@ -839,6 +839,133 @@ class PbnGen:
         boundaryImage[boundaryImage > 0] = 1
 
         return boundaryImage
+
+    def refine_region(self, mask: np.ndarray, extra_colors: int = 10):
+        """
+        對遮罩區域單獨做更細的 K-Means，結果直接覆蓋原量化圖。
+        mask: 與影像同尺寸的灰階遮罩（255=選取區域，0=其餘）
+        extra_colors: 這個區域額外分配的顏色數（不限制與基礎色重複）
+        """
+        img = self.getImage()
+        h, w = img.shape[:2]
+
+        # 調整遮罩尺寸
+        mask_resized = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        region_pixels_idx = np.where(mask_resized > 127)
+
+        if len(region_pixels_idx[0]) == 0:
+            print("⚠️ 遮罩區域沒有像素，跳過細化")
+            return
+
+        # 取出遮罩區域的原始像素
+        region_pixels = self.originalImage[region_pixels_idx]  # (N, 3)
+
+        if len(region_pixels) < extra_colors:
+            extra_colors = max(1, len(region_pixels) // 2)
+
+        # 對這個區域單獨跑 K-Means
+        from sklearn.cluster import KMeans as _KMeans
+        model = _KMeans(n_clusters=extra_colors, n_init="auto", random_state=None)
+        model.fit(region_pixels)
+        centers = model.cluster_centers_  # (extra_colors, 3)
+
+        # 如果有固定色盤，在 LAB 空間 snap
+        if self.fixed_palette is not None:
+            def rgb_to_lab(arr):
+                u8 = arr.astype(np.uint8).reshape(-1, 1, 3)
+                return cv2.cvtColor(u8, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+            centers_lab = rgb_to_lab(centers)
+            palette_lab = rgb_to_lab(self.fixed_palette)
+            snapped = []
+            for c_lab in centers_lab:
+                idx = np.argmin(np.linalg.norm(palette_lab - c_lab, axis=1))
+                snapped.append(self.fixed_palette[idx])
+            centers = np.array(snapped, dtype=np.float32)
+
+        # 將每個遮罩像素換成最近的細化顏色
+        region_pixels_f = region_pixels.astype(np.float32)
+        diff = region_pixels_f[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        nearest = np.argmin((diff ** 2).sum(axis=2), axis=1)
+        new_colors = centers[nearest].astype(np.uint8)
+
+        # 寫回影像
+        img[region_pixels_idx] = new_colors
+        self.setImage(img)
+        unique = len(np.unique(new_colors.reshape(-1, 3), axis=0))
+        print(f"✅ 遮罩區域細化完成，新增 {unique} 個細化色")
+
+    def apply_weighted_region(self, mask: np.ndarray, total_colors: int,
+                               weight_ratio: float = 0.65,
+                               bg_extra_blur: int = 0):
+        """
+        將色數預算按比例分配：選取區佔 weight_ratio，非選取區佔其餘。
+        兩區分別跑 K-Means 後合回同一張圖。
+
+        mask:           灰階遮罩（255=選取，0=非選取）
+        total_colors:   總色數預算（來自難易度設定）
+        weight_ratio:   選取區佔總色數比例（預設 0.65）
+        bg_extra_blur:  非選取區額外模糊 ksize（0=不加，入門建議 15）
+        """
+        h, w = self.originalImage.shape[:2]
+        mask_r = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        fg_idx = np.where(mask_r > 127)   # 選取區像素位置
+        bg_idx = np.where(mask_r <= 127)  # 非選取區像素位置
+
+        fg_count = len(fg_idx[0])
+        bg_count = len(bg_idx[0])
+
+        if fg_count == 0 or bg_count == 0:
+            print("⚠️ 遮罩區域異常，跳過 weighted 處理")
+            return
+
+        fg_colors = max(1, round(total_colors * weight_ratio))
+        bg_colors = max(1, total_colors - fg_colors)
+        print(f"  選取區: {fg_colors} 色 | 非選取區: {bg_colors} 色")
+
+        from sklearn.cluster import KMeans as _KMeans
+
+        def snap_to_palette(centers):
+            if self.fixed_palette is None:
+                return centers.astype(np.uint8)
+            def rgb_to_lab(arr):
+                u8 = arr.astype(np.uint8).reshape(-1, 1, 3)
+                return cv2.cvtColor(u8, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+            c_lab = rgb_to_lab(centers)
+            p_lab = rgb_to_lab(self.fixed_palette)
+            snapped = []
+            for c in c_lab:
+                idx = np.argmin(np.linalg.norm(p_lab - c, axis=1))
+                snapped.append(self.fixed_palette[idx])
+            return np.array(snapped, dtype=np.uint8)
+
+        # --- 選取區 ---
+        fg_pixels = self.originalImage[fg_idx].astype(np.float32)
+        fg_k = min(fg_colors, len(fg_pixels))
+        model_fg = _KMeans(n_clusters=fg_k, n_init="auto", random_state=None)
+        model_fg.fit(fg_pixels)
+        fg_centers = snap_to_palette(model_fg.cluster_centers_)
+        diff = fg_pixels[:, np.newaxis, :] - fg_centers[np.newaxis, :, :].astype(np.float32)
+        fg_new = fg_centers[np.argmin((diff**2).sum(axis=2), axis=1)]
+
+        # --- 非選取區（可選額外模糊） ---
+        bg_src = self.originalImage.copy()
+        if bg_extra_blur > 0:
+            ksize = bg_extra_blur | 1  # 確保奇數
+            bg_src = cv2.GaussianBlur(bg_src, (ksize, ksize), 0)
+        bg_pixels = bg_src[bg_idx].astype(np.float32)
+        bg_k = min(bg_colors, len(bg_pixels))
+        model_bg = _KMeans(n_clusters=bg_k, n_init="auto", random_state=None)
+        model_bg.fit(bg_pixels)
+        bg_centers = snap_to_palette(model_bg.cluster_centers_)
+        diff = bg_pixels[:, np.newaxis, :] - bg_centers[np.newaxis, :, :].astype(np.float32)
+        bg_new = bg_centers[np.argmin((diff**2).sum(axis=2), axis=1)]
+
+        # --- 合回影像（明確轉 uint8，確保後續 pruning 和輸出不出現 dtype 錯誤）---
+        result = self.originalImage.copy()
+        result[fg_idx] = fg_new
+        result[bg_idx] = bg_new
+        self.setImage(result.astype(np.uint8))
+        print(f"✅ weighted_region 完成")
 
     def set_final_pbn(self, blur_ksize=21, blur_sigma_color=21, blur_sigma_space=14, prune_iterations=6):
         """
@@ -943,47 +1070,26 @@ class PbnGen:
 
         return palette
 
-    def output_filled_image(self, output_path: str, scale: int = 2, border: bool = False):
+    def output_filled_image(self, output_path: str, border: bool = False):
         """
-        輸出填色完成效果圖：與 SVG 使用完全相同的輪廓和顏色，完整不透明填色，不含數字。
-        scale:  超採樣倍率（預設 2），數值越大邊緣越平滑。
-        border: 是否顯示黑色輪廓線（預設 False）。
+        輸出填色完成效果圖：直接輸出量化後的影像，每個像素已有正確顏色，不需重繪輪廓。
+        border: 是否疊加黑色輪廓線（預設 False）。
         """
-        h, w = self.getImage().shape[:2]
-        sh, sw = h * scale, w * scale
-        canvas = np.ones((sh, sw, 3), dtype=np.uint8) * 255
-
-        color_masks = self.getUniqueColorsMasks()
-
-        all_contours = []
-        min_area = 4  # 過濾掉面積太小的輪廓，避免虛線殘影
-        for color, mask in color_masks.items():
-            mask_uint8 = np.all(mask, axis=2).astype(np.uint8) * 255
-            contours, _ = cv2.findContours(
-                mask_uint8,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,  # TC89_KCOS 對細薄區域會產生虛線，改用 SIMPLE
-            )
-            for c in contours:
-                area = cv2.contourArea(c)
-                if area >= min_area:
-                    all_contours.append((area, color, c))
-
-        all_contours.sort(key=lambda x: x[0], reverse=True)
-
-        for _, color, c in all_contours:
-            bgr_color = (int(color[2]), int(color[1]), int(color[0]))
-            c_scaled = (c * scale).astype(np.int32)
-            cv2.drawContours(canvas, [c_scaled], -1, bgr_color, thickness=cv2.FILLED, lineType=cv2.LINE_AA)
+        filled_rgb = self.getImage().copy()
 
         if border:
-            for _, color, c in all_contours:
-                c_scaled = (c * scale).astype(np.int32)
-                cv2.drawContours(canvas, [c_scaled], -1, (0, 0, 0), thickness=scale, lineType=cv2.LINE_AA)
+            color_masks = self.getUniqueColorsMasks()
+            for color, mask in color_masks.items():
+                mask_uint8 = np.all(mask, axis=2).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(
+                    mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                for c in contours:
+                    if cv2.contourArea(c) >= 4:
+                        cv2.drawContours(filled_rgb, [c], -1, (0, 0, 0), thickness=1, lineType=cv2.LINE_AA)
 
-        result = cv2.resize(canvas, (w, h), interpolation=cv2.INTER_AREA)
-        # 用 imencode + 直接寫檔，避免 cv2.imwrite 在 Windows 中文路徑下靜默失敗
-        success, buf = cv2.imencode(".png", result)
+        filled_bgr = cv2.cvtColor(filled_rgb, cv2.COLOR_RGB2BGR)
+        success, buf = cv2.imencode(".png", filled_bgr)
         if success:
             with open(output_path, "wb") as f:
                 f.write(buf.tobytes())
