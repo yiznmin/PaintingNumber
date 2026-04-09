@@ -19,9 +19,9 @@ from datetime import datetime
 from pbn_gen import PbnGen
 
 # ── 設定區（只需改這裡）────────────────────────────────
-NAME         = "My"
-STYLE_TAGS   = ["人物","近景","高清"]
-MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
+NAME         = "Mom"
+STYLE_TAGS   = ["人物","近景","繪畫版"]
+MODE         = "sam_refine"   # "sam_weighted" / "sam_refine" / "sam_weighted"
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色
@@ -178,7 +178,9 @@ DIFFICULTY_LEVELS = [
         "blur_sigma_color": 51,
         "blur_sigma_space": 51,
         "prune_iterations": 10,
-        "bg_extra_blur": 21,   # weighted 模式：非選取區額外模糊
+        "bg_extra_blur": 21,        # weighted 模式：非選取區額外模糊
+        "refine_extra_colors": 8,   # sam_refine：遮罩區額外色數
+        "min_ratio_multiplier": 2.0, # 小色塊合併門檻倍數（越大合併越多）
     },
     {
         "name": "初級",
@@ -189,6 +191,8 @@ DIFFICULTY_LEVELS = [
         "blur_sigma_space": 35,
         "prune_iterations": 8,
         "bg_extra_blur": 15,
+        "refine_extra_colors": 12,
+        "min_ratio_multiplier": 1.5,
     },
     {
         "name": "中級",
@@ -199,6 +203,8 @@ DIFFICULTY_LEVELS = [
         "blur_sigma_space": 14,
         "prune_iterations": 6,
         "bg_extra_blur": 9,
+        "refine_extra_colors": 18,
+        "min_ratio_multiplier": 1.0,
     },
     {
         "name": "進階",
@@ -208,7 +214,9 @@ DIFFICULTY_LEVELS = [
         "blur_sigma_color": 13,
         "blur_sigma_space": 9,
         "prune_iterations": 3,
-        "bg_extra_blur": 0,   # 進階：非選取區不額外加模糊
+        "bg_extra_blur": 0,         # 進階：非選取區不額外加模糊
+        "refine_extra_colors": 25,
+        "min_ratio_multiplier": 0.6,
     },
 ]
 
@@ -267,14 +275,16 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
             prune_iterations=level["prune_iterations"],
         )
         if mode == "sam_refine" and sam_mask_cropped is not None:
-            print(f"  → 選取區細化 +{EXTRA_COLORS} 色")
-            pbn.refine_region(sam_mask_cropped, extra_colors=EXTRA_COLORS)
+            extra_colors = level.get("refine_extra_colors", EXTRA_COLORS)
+            print(f"  → 選取區細化 +{extra_colors} 色")
+            pbn.refine_region(sam_mask_cropped, extra_colors=extra_colors)
 
-    # 小色塊合併：根據畫布尺寸自動算門檻；sam_refine 遮罩內外分開處理
+    # 小色塊合併：根據畫布尺寸 × 難易度倍數自動算門檻
     img_h, img_w = pbn.getImage().shape[:2]
-    min_ratio  = calc_min_ratio(canvas_cm[0], img_w, img_h)
+    multiplier = level.get("min_ratio_multiplier", 1.0)
+    min_ratio  = calc_min_ratio(canvas_cm[0], img_w, img_h) * multiplier
     merge_mask = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
-    print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm → min_ratio={min_ratio:.4f}")
+    print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm × {multiplier}× → min_ratio={min_ratio:.4f}")
     pbn.merge_tiny_colors(min_ratio=min_ratio, exclude_mask=merge_mask)
 
     svg_path    = os.path.join(level_dir, "template.svg")
@@ -318,7 +328,7 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
         },
         "sam_used": sam_mask is not None,
         "sam_mode": mode if sam_mask is not None else None,
-        "sam_extra_colors": EXTRA_COLORS if mode == "sam_refine" else 0,
+        "sam_extra_colors": level.get("refine_extra_colors", EXTRA_COLORS) if mode == "sam_refine" else 0,
         "sam_weight_ratio": WEIGHT_RATIO if mode == "sam_weighted" else None,
         "num_colors_used": len(used_colors),
         "colors": [
@@ -420,7 +430,7 @@ def main():
         print(f"  畫布規格：{canvas_cm[0]}×{canvas_cm[1]} cm")
         print(f"{'#'*45}")
 
-        suggestions = pricing_suggestion(sam_mask, MODE, EXTRA_COLORS, canvas_cm)
+        suggestions = pricing_suggestion(sam_mask, MODE, EXTRA_COLORS, canvas_cm)  # 用全域預設值做說明
         print("定價建議：")
         for s in suggestions:
             print(f"  {s}")
