@@ -845,6 +845,10 @@ class PbnGen:
         對遮罩區域單獨做更細的 K-Means，結果直接覆蓋原量化圖。
         mask: 與影像同尺寸的灰階遮罩（255=選取區域，0=其餘）
         extra_colors: 這個區域額外分配的顏色數（不限制與基礎色重複）
+
+        稀少顏色保護：K-Means 完成後，對指派誤差偏高的像素（前 15%）
+        再跑一次 mini K-Means（最多 3 色），把救回的顏色合入 centers，
+        避免嘴唇等小面積高彩色被多數派膚色吞掉。
         """
         img = self.getImage()
         h, w = img.shape[:2]
@@ -865,9 +869,36 @@ class PbnGen:
 
         # 對這個區域單獨跑 K-Means
         from sklearn.cluster import KMeans as _KMeans
-        model = _KMeans(n_clusters=extra_colors, n_init="auto", random_state=None)
-        model.fit(region_pixels)
+        model = _KMeans(n_clusters=extra_colors, n_init="auto", random_state=42)
+        labels = model.fit_predict(region_pixels)
         centers = model.cluster_centers_  # (extra_colors, 3)
+
+        # ── 稀少顏色保護 ──────────────────────────────────────────────
+        region_pixels_f = region_pixels.astype(np.float32)
+        assigned = centers[labels]
+        distances = np.linalg.norm(region_pixels_f - assigned, axis=1)
+        threshold = np.percentile(distances, 85)   # 前 15% 高誤差像素
+        outlier_mask = distances > threshold
+
+        # 亮度保護：LAB L* > 78 的像素（眼白、高光）強制加入
+        lab_pixels = cv2.cvtColor(
+            region_pixels.astype(np.uint8).reshape(-1, 1, 3),
+            cv2.COLOR_RGB2LAB
+        ).reshape(-1, 3).astype(np.float32)
+        bright_mask = lab_pixels[:, 0] > 200
+        outlier_mask = outlier_mask | bright_mask
+        if bright_mask.sum() > 0:
+            print(f"  → 亮度保護：{int(bright_mask.sum())} 個高亮像素（眼白/高光）")
+
+        if outlier_mask.sum() >= 10:
+            outlier_pixels = region_pixels_f[outlier_mask]
+            n_rescue = min(5, max(1, int(outlier_mask.sum() // 50)))
+            if len(outlier_pixels) >= n_rescue:
+                rm = _KMeans(n_clusters=n_rescue, n_init="auto", random_state=42)
+                rm.fit(outlier_pixels)
+                centers = np.vstack([centers, rm.cluster_centers_])
+                print(f"  → 稀少顏色保護：救回 {n_rescue} 色（outlier {outlier_mask.sum()} px）")
+        # ──────────────────────────────────────────────────────────────
 
         # 如果有固定色盤，在 LAB 空間 snap
         if self.fixed_palette is not None:
@@ -883,16 +914,97 @@ class PbnGen:
             centers = np.array(snapped, dtype=np.float32)
 
         # 將每個遮罩像素換成最近的細化顏色
-        region_pixels_f = region_pixels.astype(np.float32)
         diff = region_pixels_f[:, np.newaxis, :] - centers[np.newaxis, :, :]
         nearest = np.argmin((diff ** 2).sum(axis=2), axis=1)
         new_colors = centers[nearest].astype(np.uint8)
+
+        # ── 微小色塊合併（可繪性過濾）────────────────────────────────
+        # 找出佔比過小的顏色（低於遮罩區域總像素數的 0.5%，且絕對值 < 30 pixels）
+        total_pixels = len(new_colors)
+        min_pixels = max(30, int(total_pixels * 0.005))
+        unique_colors, counts = np.unique(new_colors.reshape(-1, 3), axis=0, return_counts=True)
+        tiny_colors = unique_colors[counts < min_pixels]
+
+        if len(tiny_colors) > 0:
+            merged = 0
+            # 建立「有效顏色」集合（排除微小色）
+            valid_colors = unique_colors[counts >= min_pixels].astype(np.float32)
+            if len(valid_colors) > 0:
+                for tc in tiny_colors:
+                    tc_f = tc.astype(np.float32)
+                    # 找最近的有效顏色
+                    dists = np.linalg.norm(valid_colors - tc_f, axis=1)
+                    nearest_valid = valid_colors[np.argmin(dists)].astype(np.uint8)
+                    # 把這個微小色的所有像素換成最近有效顏色
+                    match = np.all(new_colors == tc, axis=1)
+                    new_colors[match] = nearest_valid
+                    merged += match.sum()
+                print(f"  → 微小色塊合併：{len(tiny_colors)} 色 / {merged} 像素 併入鄰近色")
+        # ──────────────────────────────────────────────────────────────
 
         # 寫回影像
         img[region_pixels_idx] = new_colors
         self.setImage(img)
         unique = len(np.unique(new_colors.reshape(-1, 3), axis=0))
-        print(f"✅ 遮罩區域細化完成，新增 {unique} 個細化色")
+        print(f"✅ 遮罩區域細化完成，{unique} 個細化色")
+
+    def merge_tiny_colors(self, min_pixels: int = None, min_ratio: float = 0.005,
+                          exclude_mask: np.ndarray = None):
+        """
+        小色塊合併：把佔比過低的顏色替換成最近的顏色。
+        exclude_mask: 若提供（與影像同尺寸的灰階遮罩），遮罩內外分開處理，
+                      避免遮罩內救回的稀少顏色被遮罩外的統計吃掉。
+        min_pixels:   絕對像素數下限（None = 自動由 min_ratio 計算）
+        min_ratio:    各區域總像素佔比下限（預設 0.5%）
+        """
+        img = self.getImage().astype(np.uint8)
+        h, w = img.shape[:2]
+
+        def _merge_region(pixel_arr, ratio):
+            """對一段像素陣列做小色合併，回傳修改後的陣列"""
+            total = len(pixel_arr)
+            thresh = max(30, int(total * ratio))
+            unique_c, counts = np.unique(pixel_arr, axis=0, return_counts=True)
+            tiny = unique_c[counts < thresh]
+            valid = unique_c[counts >= thresh].astype(np.float32)
+            if len(tiny) == 0 or len(valid) == 0:
+                return pixel_arr, 0, 0
+            merged = 0
+            for tc in tiny:
+                nearest = valid[np.argmin(np.linalg.norm(valid - tc.astype(np.float32), axis=1))].astype(np.uint8)
+                match = np.all(pixel_arr == tc, axis=1)
+                pixel_arr[match] = nearest
+                merged += int(match.sum())
+            return pixel_arr, len(tiny), merged
+
+        pixels = img.reshape(-1, 3)
+
+        if exclude_mask is not None:
+            mask_r = cv2.resize(exclude_mask, (w, h), interpolation=cv2.INTER_NEAREST).reshape(-1)
+            fg_idx = mask_r > 127   # 遮罩內（SAM 細化區）
+            bg_idx = ~fg_idx        # 遮罩外
+
+            fg_pixels = pixels[fg_idx].copy()
+            bg_pixels = pixels[bg_idx].copy()
+
+            fg_pixels, fg_n, fg_px = _merge_region(fg_pixels, min_ratio)
+            bg_pixels, bg_n, bg_px = _merge_region(bg_pixels, min_ratio)
+
+            pixels[fg_idx] = fg_pixels
+            pixels[bg_idx] = bg_pixels
+
+            total_n = fg_n + bg_n
+            total_px = fg_px + bg_px
+            region_info = f"（遮罩內 {fg_n} 色/{fg_px} px；遮罩外 {bg_n} 色/{bg_px} px）"
+        else:
+            if min_pixels is None:
+                min_pixels = max(30, int(h * w * min_ratio))
+            pixels, total_n, total_px = _merge_region(pixels, min_ratio)
+            region_info = ""
+
+        if total_n > 0:
+            self.setImage(pixels.reshape(h, w, 3))
+            print(f"  → 小色塊合併：{total_n} 個顏色 / {total_px} 個像素{region_info}")
 
     def apply_weighted_region(self, mask: np.ndarray, total_colors: int,
                                weight_ratio: float = 0.65,

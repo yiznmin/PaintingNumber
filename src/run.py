@@ -11,21 +11,29 @@ run.py — 數字油畫主入口
 """
 
 import cv2
+import math
 import os
 import json
+import numpy as np
 from datetime import datetime
 from pbn_gen import PbnGen
 
 # ── 設定區（只需改這裡）────────────────────────────────
-NAME         = "egg"
-STYLE_TAGS   = ["食物", "暖色調"]
-MODE         = "sam_weighted"   # "standard" / "sam_refine" / "sam_weighted"
+NAME         = "My"
+STYLE_TAGS   = ["人物","近景","高清"]
+MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色
 
 # sam_weighted 參數
 WEIGHT_RATIO  = 0.65  # 選取區佔總色數比例（0.5~0.8）
+
+# 畫布尺寸規格
+# None = 根據圖片比例自動推薦 3 個尺寸
+# 手動指定範例：[(30, 45), (40, 60), (50, 75)]
+CANVAS_SIZES_CM   = None
+MIN_BRUSH_DIAM_CM = 1.5   # 最小可塗色塊直徑（公分），建議 1.0~2.0
 # ────────────────────────────────────────────────────────
 
 IMAGES_DIR     = r"D:\website\PaintLearn\paint-by-number\images"
@@ -33,10 +41,138 @@ IMAGES_SAM_DIR = r"D:\website\PaintLearn\paint-by-number\images_sam"
 OUTPUT_BASE    = r"D:\website\PaintLearn\paint-by-number\output"
 STATS_PATH     = os.path.join(OUTPUT_BASE, "color_stats.json")
 
+
+# 所有支援的畫布規格（寬, 高），單位公分
+_STANDARD_SIZES = [
+    # 正方形
+    (30, 30), (40, 40), (50, 50), (60, 60), (70, 70), (80, 80), (100, 100),
+    # 直幅
+    (30, 40), (30, 50),
+    (40, 50), (40, 60),
+    (50, 60), (50, 70),
+    (60, 80), (60, 90), (60, 120),
+    (70, 90), (70, 100),
+    (80, 100), (80, 120),
+    (90, 120),
+    (100, 150),
+    # 橫幅（直幅翻轉）
+    (40, 30), (50, 30),
+    (50, 40), (60, 40),
+    (60, 50), (70, 50),
+    (80, 60), (90, 60), (120, 60),
+    (90, 70), (100, 70),
+    (100, 80), (120, 80),
+    (120, 90),
+    (150, 100),
+]
+
+
+def suggest_canvas_sizes(img_w_px, img_h_px, n=3):
+    """
+    根據圖片長寬比，從標準畫布規格中挑出比例最接近的 n 個，
+    由小到大排列。
+    """
+    img_ratio = img_w_px / img_h_px
+    scored = []
+    for w, h in _STANDARD_SIZES:
+        ratio_diff = abs((w / h) - img_ratio)
+        area = w * h
+        scored.append((ratio_diff, area, (w, h)))
+    scored.sort(key=lambda x: (round(x[0], 3), x[1]))
+    # 取比例最接近的，且面積由小到大選 n 個不重複比例
+    seen_ratios, result = set(), []
+    for _, area, size in scored:
+        r = round(size[0] / size[1], 3)
+        if r not in seen_ratios:
+            seen_ratios.add(r)
+            result.append(size)
+        if len(result) == n:
+            break
+    # 按面積從小到大排序
+    result.sort(key=lambda s: s[0] * s[1])
+    return result
+
+
+def crop_to_canvas_ratio(img_bgr, mask, canvas_w_cm, canvas_h_cm):
+    """
+    將圖片（和遮罩）中央裁切成符合畫布比例。
+    回傳 (cropped_bgr, cropped_mask)，cropped_mask 為 None 若輸入 mask 為 None。
+    """
+    ih, iw = img_bgr.shape[:2]
+    target_ratio = canvas_w_cm / canvas_h_cm
+    img_ratio    = iw / ih
+
+    if abs(img_ratio - target_ratio) < 0.01:   # 比例差距 < 1%，不裁切
+        return img_bgr, mask
+
+    if img_ratio > target_ratio:
+        # 圖片太寬 → 裁左右，保留全高
+        new_w = int(ih * target_ratio)
+        x0 = (iw - new_w) // 2
+        cropped = img_bgr[:, x0:x0 + new_w]
+        cropped_mask = mask[:, x0:x0 + new_w] if mask is not None else None
+    else:
+        # 圖片太高 → 裁上下，保留全寬
+        new_h = int(iw / target_ratio)
+        y0 = (ih - new_h) // 2
+        cropped = img_bgr[y0:y0 + new_h, :]
+        cropped_mask = mask[y0:y0 + new_h, :] if mask is not None else None
+
+    cih, ciw = cropped.shape[:2]
+    if ciw != iw or cih != ih:
+        print(f"  裁切：{iw}×{ih} → {ciw}×{cih}（符合 {canvas_w_cm}:{canvas_h_cm} 比例）")
+    return cropped, cropped_mask
+
+
+def calc_min_ratio(canvas_w_cm, img_w_px, img_h_px,
+                   min_brush_diam_cm=MIN_BRUSH_DIAM_CM):
+    """根據畫布尺寸與最小筆觸直徑，計算 merge_tiny_colors 的 min_ratio。"""
+    pixel_size_cm = canvas_w_cm / img_w_px          # 每 px 對應幾公分
+    radius_px     = (min_brush_diam_cm / 2) / pixel_size_cm
+    min_pixels    = math.pi * radius_px ** 2         # 圓形面積近似
+    return min_pixels / (img_w_px * img_h_px)
+
+
+def pricing_suggestion(sam_mask, mode, extra_colors, canvas_cm):
+    """
+    根據 SAM 遮罩選取資訊給出定價等級建議。
+    sam_mask:     遮罩陣列（None = 無選取）
+    mode:         standard / sam_refine / sam_weighted
+    extra_colors: sam_refine 額外色數
+    canvas_cm:    (寬, 高) 公分
+    """
+    w, h = canvas_cm
+    lines = []
+
+    if sam_mask is None or mode == "standard":
+        lines.append("無選取細化區域（standard 模式）")
+        lines.append("建議：基礎定價")
+    else:
+        mask_ratio = round(float((sam_mask > 127).sum()) / sam_mask.size, 3)
+        lines.append(f"細化區域佔圖片 {mask_ratio*100:.1f}%，模式：{mode}")
+
+        if mode == "sam_refine":
+            if mask_ratio >= 0.25:
+                lines.append(f"選取範圍大 × 細化 +{extra_colors} 色 → 整體還原度高")
+                lines.append("定價參考：中～高階商品")
+            else:
+                lines.append(f"選取範圍小（局部細節）× 細化 +{extra_colors} 色")
+                lines.append("定價參考：標準商品，局部精細")
+        elif mode == "sam_weighted":
+            lines.append("選取區高比重分色，非選取區簡化")
+            if mask_ratio >= 0.3:
+                lines.append("定價參考：中階商品")
+            else:
+                lines.append("定價參考：標準商品")
+
+    lines.append(f"畫布：{w}×{h} cm")
+    return lines
+
+
 DIFFICULTY_LEVELS = [
     {
         "name": "入門",
-        "num_colors": 15,
+        "num_colors": 18,
         "pruning_threshold": 8e-4,
         "blur_ksize": 31,
         "blur_sigma_color": 51,
@@ -46,7 +182,7 @@ DIFFICULTY_LEVELS = [
     },
     {
         "name": "初級",
-        "num_colors": 20,
+        "num_colors": 24,
         "pruning_threshold": 2e-4,
         "blur_ksize": 25,
         "blur_sigma_color": 35,
@@ -86,22 +222,27 @@ def load_sam_mask(name):
     return None
 
 
-def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
+def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
+                     canvas_cm=(40, 60), pricing_info=None):
     level_name = level["name"]
     print(f"\n{'='*40}")
-    print(f"  [{level_name}] 模式：{mode}")
+    print(f"  [{level_name}] 模式：{mode}  畫布：{canvas_cm[0]}×{canvas_cm[1]} cm")
     print(f"{'='*40}")
 
-    if mode == "sam_weighted" and sam_mask is not None:
+    # 載入圖片並裁切成符合畫布比例
+    img_bgr = cv2.imdecode(np.fromfile(input_image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    img_bgr, sam_mask_cropped = crop_to_canvas_ratio(img_bgr, sam_mask, canvas_cm[0], canvas_cm[1])
+
+    if mode == "sam_weighted" and sam_mask_cropped is not None:
         # weighted 模式：不走 set_final_pbn，改由 apply_weighted_region 直接量化
         pbn = PbnGen(
-            input_image_path,
+            img_bgr,
             num_colors=level["num_colors"],
             pruningThreshold=level["pruning_threshold"],
             fixed_palette=None,
         )
         pbn.apply_weighted_region(
-            mask=sam_mask,
+            mask=sam_mask_cropped,
             total_colors=level["num_colors"],
             weight_ratio=WEIGHT_RATIO,
             bg_extra_blur=level["bg_extra_blur"],
@@ -114,7 +255,7 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
     else:
         # standard / sam_refine：走正常流程
         pbn = PbnGen(
-            input_image_path,
+            img_bgr,
             num_colors=level["num_colors"],
             pruningThreshold=level["pruning_threshold"],
             fixed_palette=None,
@@ -125,9 +266,16 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
             blur_sigma_space=level["blur_sigma_space"],
             prune_iterations=level["prune_iterations"],
         )
-        if mode == "sam_refine" and sam_mask is not None:
+        if mode == "sam_refine" and sam_mask_cropped is not None:
             print(f"  → 選取區細化 +{EXTRA_COLORS} 色")
-            pbn.refine_region(sam_mask, extra_colors=EXTRA_COLORS)
+            pbn.refine_region(sam_mask_cropped, extra_colors=EXTRA_COLORS)
+
+    # 小色塊合併：根據畫布尺寸自動算門檻；sam_refine 遮罩內外分開處理
+    img_h, img_w = pbn.getImage().shape[:2]
+    min_ratio  = calc_min_ratio(canvas_cm[0], img_w, img_h)
+    merge_mask = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
+    print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm → min_ratio={min_ratio:.4f}")
+    pbn.merge_tiny_colors(min_ratio=min_ratio, exclude_mask=merge_mask)
 
     svg_path    = os.path.join(level_dir, "template.svg")
     filled_path = os.path.join(level_dir, "filled.png")
@@ -136,12 +284,29 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
     palette_data = pbn.output_to_svg(svg_path, json_path)
     pbn.output_filled_image(filled_path)
 
+    # ── 顏色佔比分析 ─────────────────────────────────────────────────
+    filled_img = cv2.imdecode(
+        np.fromfile(filled_path, dtype=np.uint8), cv2.IMREAD_COLOR
+    )
+    filled_rgb = cv2.cvtColor(filled_img, cv2.COLOR_BGR2RGB)
+    img_h, img_w = filled_rgb.shape[:2]
+    total_px = img_h * img_w
+    pixels_flat = filled_rgb.reshape(-1, 3)
+
+    color_pixel_map = {}
+    for item in palette_data:
+        rgb = tuple(item["rgb"])
+        match = np.all(pixels_flat == list(rgb), axis=1)
+        color_pixel_map[item["template_id"]] = int(match.sum())
+    # ──────────────────────────────────────────────────────────────────
+
     used_colors = sorted(palette_data, key=lambda x: x["template_id"])
     summary = {
         "image": NAME,
         "style_tags": STYLE_TAGS,
         "mode": mode,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "image_size": {"width": img_w, "height": img_h},
         "difficulty": level_name,
         "params": {
             "num_colors_limit": level["num_colors"],
@@ -161,9 +326,16 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
                 "id": item["template_id"],
                 "rgb": item["rgb"],
                 "hex": "#{:02X}{:02X}{:02X}".format(*item["rgb"]),
+                "pixels": color_pixel_map.get(item["template_id"], 0),
+                "percent": round(
+                    color_pixel_map.get(item["template_id"], 0) / total_px * 100, 2
+                ),
             }
             for item in used_colors
         ],
+        "canvas_cm": {"width": canvas_cm[0], "height": canvas_cm[1]},
+        "min_ratio": round(min_ratio, 6),
+        "pricing_info": pricing_info or {},
         "approved": False,
         "notes": "",
         "workflow_hints": {
@@ -176,7 +348,15 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask):
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    print(f"實際使用顏色數：{summary['num_colors_used']}")
+    # 印出顏色報表
+    colors_by_pct = sorted(summary["colors"], key=lambda x: -x["percent"])
+    print(f"\n  尺寸：{img_w} x {img_h} px　顏色數：{len(used_colors)}")
+    print(f"  {'號':>3}  {'HEX':^8}  {'像素數':>8}  {'佔比':>6}")
+    print(f"  {'-'*34}")
+    for c in colors_by_pct:
+        print(f"  {c['id']:>3}  {c['hex']}  {c['pixels']:>8,}  {c['percent']:>5.1f}%")
+
+    print(f"\n實際使用顏色數：{summary['num_colors_used']}")
     return summary
 
 
@@ -221,18 +401,46 @@ def main():
     if MODE != "standard" and sam_mask is None:
         print(f"⚠️ 模式 {MODE} 需要遮罩，但找不到 {NAME}_mask.png，改用 standard 模式")
 
-    mode_dir = os.path.join(OUTPUT_BASE, NAME, MODE)
-    os.makedirs(mode_dir, exist_ok=True)
+    # 決定要跑的畫布尺寸
+    img = cv2.imdecode(np.fromfile(input_image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    img_h, img_w = img.shape[:2]
 
-    summaries = []
-    for level in DIFFICULTY_LEVELS:
-        level_dir = os.path.join(mode_dir, level["name"])
-        os.makedirs(level_dir, exist_ok=True)
-        summary = run_single_level(input_image_path, level_dir, level, MODE, sam_mask)
-        summaries.append(summary)
+    if CANVAS_SIZES_CM:
+        canvas_list = CANVAS_SIZES_CM
+        print(f"\n畫布規格（手動指定）：{canvas_list}")
+    else:
+        canvas_list = suggest_canvas_sizes(img_w, img_h)
+        print(f"\n圖片尺寸：{img_w}×{img_h} px（比例 {img_w/img_h:.2f}）")
+        print(f"自動推薦畫布規格：{canvas_list}")
 
-    update_color_stats(summaries)
-    print(f"\n✅ 完成，結果在：{mode_dir}")
+    all_summaries = []
+    for canvas_cm in canvas_list:
+        canvas_str = f"{canvas_cm[0]}x{canvas_cm[1]}"
+        print(f"\n{'#'*45}")
+        print(f"  畫布規格：{canvas_cm[0]}×{canvas_cm[1]} cm")
+        print(f"{'#'*45}")
+
+        suggestions = pricing_suggestion(sam_mask, MODE, EXTRA_COLORS, canvas_cm)
+        print("定價建議：")
+        for s in suggestions:
+            print(f"  {s}")
+
+        pricing_info = {"canvas_cm": list(canvas_cm), "pricing_suggestion": suggestions}
+
+        mode_dir = os.path.join(OUTPUT_BASE, NAME, MODE, canvas_str)
+        os.makedirs(mode_dir, exist_ok=True)
+
+        for level in DIFFICULTY_LEVELS:
+            level_dir = os.path.join(mode_dir, level["name"])
+            os.makedirs(level_dir, exist_ok=True)
+            summary = run_single_level(
+                input_image_path, level_dir, level, MODE, sam_mask,
+                canvas_cm=canvas_cm, pricing_info=pricing_info
+            )
+            all_summaries.append(summary)
+
+    update_color_stats(all_summaries)
+    print(f"\n✅ 完成，結果在：{os.path.join(OUTPUT_BASE, NAME, MODE)}")
 
 
 if __name__ == "__main__":

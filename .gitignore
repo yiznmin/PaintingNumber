@@ -10,6 +10,9 @@ models/
 # SAM 來源圖片（含版權），只上傳遮罩和點選記錄
 images_sam/*.jpg
 
+# 最終打包結果（含原圖，可重新產生）
+final/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
