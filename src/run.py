@@ -20,8 +20,8 @@ from pbn_gen import PbnGen
 
 # ── 設定區（只需改這裡）────────────────────────────────
 NAME         = "Mom"
-STYLE_TAGS   = ["人物","近景","繪畫版"]
-MODE         = "sam_refine"   # "sam_weighted" / "sam_refine" / "sam_weighted"
+STYLE_TAGS   = ["人物","自拍","卡通版"]
+MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色
@@ -33,7 +33,7 @@ WEIGHT_RATIO  = 0.65  # 選取區佔總色數比例（0.5~0.8）
 # None = 根據圖片比例自動推薦 3 個尺寸
 # 手動指定範例：[(30, 45), (40, 60), (50, 75)]
 CANVAS_SIZES_CM   = None
-MIN_BRUSH_DIAM_CM = 1.5   # 最小可塗色塊直徑（公分），建議 1.0~2.0
+MIN_BRUSH_DIAM_CM = 1  # 最小可塗色塊直徑（公分），建議 1.0~2.0
 # ────────────────────────────────────────────────────────
 
 IMAGES_DIR     = r"D:\website\PaintLearn\paint-by-number\images"
@@ -133,6 +133,15 @@ def calc_min_ratio(canvas_w_cm, img_w_px, img_h_px,
     return min_pixels / (img_w_px * img_h_px)
 
 
+def calc_min_radius_px(canvas_w_cm, img_w_px,
+                       min_brush_diam_cm=MIN_BRUSH_DIAM_CM):
+    """根據畫布實體尺寸，計算最小可下筆半徑（像素）。
+    幾何標準：最大內切圓直徑 >= min_brush_diam_cm（預設 0.2cm）才不被合併。
+    """
+    pixel_size_cm = canvas_w_cm / img_w_px   # 每 px 多少公分
+    return (min_brush_diam_cm / 2) / pixel_size_cm
+
+
 def pricing_suggestion(sam_mask, mode, extra_colors, canvas_cm):
     """
     根據 SAM 遮罩選取資訊給出定價等級建議。
@@ -225,7 +234,7 @@ def load_sam_mask(name):
     mask_path = os.path.join(IMAGES_SAM_DIR, f"{name}_mask.png")
     if os.path.exists(mask_path):
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        print(f"✅ 載入 SAM 遮罩：{mask_path}")
+        print(f"[OK] 載入 SAM 遮罩：{mask_path}")
         return mask
     return None
 
@@ -279,19 +288,19 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
             print(f"  → 選取區細化 +{extra_colors} 色")
             pbn.refine_region(sam_mask_cropped, extra_colors=extra_colors)
 
-    # 小色塊合併：根據畫布尺寸 × 難易度倍數自動算門檻
+    # 小色塊合併：幾何門檻（最大內切圓半徑）× 難易度倍數
     img_h, img_w = pbn.getImage().shape[:2]
-    multiplier = level.get("min_ratio_multiplier", 1.0)
-    min_ratio  = calc_min_ratio(canvas_cm[0], img_w, img_h) * multiplier
-    merge_mask = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
-    print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm × {multiplier}× → min_ratio={min_ratio:.4f}")
-    pbn.merge_tiny_colors(min_ratio=min_ratio, exclude_mask=merge_mask)
+    multiplier     = level.get("min_ratio_multiplier", 1.0)
+    min_radius_px  = calc_min_radius_px(canvas_cm[0], img_w) * multiplier
+    merge_mask     = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
+    print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm × {multiplier}× → min_radius={min_radius_px:.1f}px")
+    pbn.merge_tiny_colors(min_radius_px=min_radius_px, exclude_mask=merge_mask)
 
     svg_path    = os.path.join(level_dir, "template.svg")
     filled_path = os.path.join(level_dir, "filled.png")
     json_path   = os.path.join(level_dir, "palette.json")
 
-    palette_data = pbn.output_to_svg(svg_path, json_path)
+    palette_data = pbn.output_to_svg(svg_path, json_path, min_radius_px=min_radius_px)
     pbn.output_filled_image(filled_path)
 
     # ── 顏色佔比分析 ─────────────────────────────────────────────────
@@ -344,7 +353,7 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
             for item in used_colors
         ],
         "canvas_cm": {"width": canvas_cm[0], "height": canvas_cm[1]},
-        "min_ratio": round(min_ratio, 6),
+        "min_radius_px": round(min_radius_px, 3),
         "pricing_info": pricing_info or {},
         "approved": False,
         "notes": "",
@@ -393,7 +402,7 @@ def update_color_stats(summaries):
     os.makedirs(os.path.dirname(STATS_PATH), exist_ok=True)
     with open(STATS_PATH, "w", encoding="utf-8") as f:
         json.dump(stats, f, ensure_ascii=False, indent=2)
-    print(f"\n📊 顏色統計已更新（共 {len(stats)} 個顏色）")
+    print(f"\n[chart] 顏色統計已更新（共 {len(stats)} 個顏色）")
 
 
 def main():
@@ -403,13 +412,13 @@ def main():
                        else os.path.join(IMAGES_DIR, f"{NAME}.jpg")
 
     if not os.path.exists(input_image_path):
-        print(f"❌ 找不到圖片：{NAME}.jpg")
+        print(f"[ERR] 找不到圖片：{NAME}.jpg")
         return
 
     # 載入遮罩
     sam_mask = load_sam_mask(NAME) if MODE in ("sam_refine", "sam_weighted") else None
     if MODE != "standard" and sam_mask is None:
-        print(f"⚠️ 模式 {MODE} 需要遮罩，但找不到 {NAME}_mask.png，改用 standard 模式")
+        print(f"[!] 模式 {MODE} 需要遮罩，但找不到 {NAME}_mask.png，改用 standard 模式")
 
     # 決定要跑的畫布尺寸
     img = cv2.imdecode(np.fromfile(input_image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -450,7 +459,7 @@ def main():
             all_summaries.append(summary)
 
     update_color_stats(all_summaries)
-    print(f"\n✅ 完成，結果在：{os.path.join(OUTPUT_BASE, NAME, MODE)}")
+    print(f"\n[OK] 完成，結果在：{os.path.join(OUTPUT_BASE, NAME, MODE)}")
 
 
 if __name__ == "__main__":

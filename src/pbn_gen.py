@@ -6,6 +6,7 @@ from sklearn.cluster import KMeans
 from kneed import KneeLocator
 from sklearn.utils import shuffle
 from shapely.geometry import Polygon, Point
+from shapely.ops import polylabel
 import svgwrite
 import json
 import random
@@ -117,7 +118,7 @@ class PbnGen:
         # print(q_img.dtype)
 
         if self.color_suggestions:
-            print(f"⚠️ 提醒：發現 {len(self.color_suggestions)} 個區域色差較大，建議增加色系：", self.color_suggestions)
+            print(f"[!] 提醒：發現 {len(self.color_suggestions)} 個區域色差較大，建議增加色系：", self.color_suggestions)
 
         self.setImage(q_img.copy())
 
@@ -858,7 +859,7 @@ class PbnGen:
         region_pixels_idx = np.where(mask_resized > 127)
 
         if len(region_pixels_idx[0]) == 0:
-            print("⚠️ 遮罩區域沒有像素，跳過細化")
+            print("[!] 遮罩區域沒有像素，跳過細化")
             return
 
         # 取出遮罩區域的原始像素
@@ -946,65 +947,94 @@ class PbnGen:
         img[region_pixels_idx] = new_colors
         self.setImage(img)
         unique = len(np.unique(new_colors.reshape(-1, 3), axis=0))
-        print(f"✅ 遮罩區域細化完成，{unique} 個細化色")
+        print(f"[OK] 遮罩區域細化完成，{unique} 個細化色")
 
-    def merge_tiny_colors(self, min_pixels: int = None, min_ratio: float = 0.005,
-                          exclude_mask: np.ndarray = None):
+    def merge_tiny_colors(self, min_radius_px: float,
+                          exclude_mask: np.ndarray = None,
+                          fg_radius_scale: float = 0.5):
         """
-        小色塊合併：把佔比過低的顏色替換成最近的顏色。
-        exclude_mask: 若提供（與影像同尺寸的灰階遮罩），遮罩內外分開處理，
-                      避免遮罩內救回的稀少顏色被遮罩外的統計吃掉。
-        min_pixels:   絕對像素數下限（None = 自動由 min_ratio 計算）
-        min_ratio:    各區域總像素佔比下限（預設 0.5%）
+        小色塊合併：基於幾何可繪性（最大內切圓半徑）。
+        每個連通元件獨立判斷——只要最大內切圓半徑 < min_radius_px 就合併。
+
+        min_radius_px:   最小可下筆半徑（像素），由畫布尺寸換算（0.1cm）
+        exclude_mask:    SAM 遮罩（遮罩內用 fg_radius_scale 縮小門檻保留細節）
+        fg_radius_scale: 遮罩內門檻倍率（預設 0.5 = 允許更細小的色塊）
         """
         img = self.getImage().astype(np.uint8)
         h, w = img.shape[:2]
+        result = img.copy()
 
-        def _merge_region(pixel_arr, ratio):
-            """對一段像素陣列做小色合併，回傳修改後的陣列"""
-            total = len(pixel_arr)
-            thresh = max(30, int(total * ratio))
-            unique_c, counts = np.unique(pixel_arr, axis=0, return_counts=True)
-            tiny = unique_c[counts < thresh]
-            valid = unique_c[counts >= thresh].astype(np.float32)
-            if len(tiny) == 0 or len(valid) == 0:
-                return pixel_arr, 0, 0
-            merged = 0
-            for tc in tiny:
-                nearest = valid[np.argmin(np.linalg.norm(valid - tc.astype(np.float32), axis=1))].astype(np.uint8)
-                match = np.all(pixel_arr == tc, axis=1)
-                pixel_arr[match] = nearest
-                merged += int(match.sum())
-            return pixel_arr, len(tiny), merged
-
-        pixels = img.reshape(-1, 3)
-
+        # 準備 fg/bg 二值遮罩
         if exclude_mask is not None:
-            mask_r = cv2.resize(exclude_mask, (w, h), interpolation=cv2.INTER_NEAREST).reshape(-1)
-            fg_idx = mask_r > 127   # 遮罩內（SAM 細化區）
-            bg_idx = ~fg_idx        # 遮罩外
-
-            fg_pixels = pixels[fg_idx].copy()
-            bg_pixels = pixels[bg_idx].copy()
-
-            fg_pixels, fg_n, fg_px = _merge_region(fg_pixels, min_ratio)
-            bg_pixels, bg_n, bg_px = _merge_region(bg_pixels, min_ratio)
-
-            pixels[fg_idx] = fg_pixels
-            pixels[bg_idx] = bg_pixels
-
-            total_n = fg_n + bg_n
-            total_px = fg_px + bg_px
-            region_info = f"（遮罩內 {fg_n} 色/{fg_px} px；遮罩外 {bg_n} 色/{bg_px} px）"
+            mask_r = cv2.resize(exclude_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            fg_bin = (mask_r > 127)
         else:
-            if min_pixels is None:
-                min_pixels = max(30, int(h * w * min_ratio))
-            pixels, total_n, total_px = _merge_region(pixels, min_ratio)
-            region_info = ""
+            fg_bin = None
 
-        if total_n > 0:
-            self.setImage(pixels.reshape(h, w, 3))
-            print(f"  → 小色塊合併：{total_n} 個顏色 / {total_px} 個像素{region_info}")
+        # 找出所有唯一顏色
+        unique_colors = np.unique(img.reshape(-1, 3), axis=0)
+
+        # 第一遍：掃描各色塊，記錄哪些元件要合併（不存全圖遮罩，省記憶體）
+        # surviving_colors: 有至少一個元件存活的顏色 set
+        # tiny_list: [(color_tuple, y0,y1,x0,x1, label_id)] 待合併元件的定位資訊
+        surviving_colors = set()
+        tiny_list = []  # (color_tuple, label_map, label_id) — label_map 是小區域的
+
+        for color in unique_colors:
+            color_key = tuple(int(v) for v in color)
+            color_mask = np.all(img == color, axis=2).astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(color_mask, connectivity=8)
+            color_has_survivor = False
+            for label_id in range(1, num_labels):
+                ys, xs = np.where(labels == label_id)
+                if len(ys) == 0:
+                    continue
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                roi_comp = (labels[y0:y1, x0:x1] == label_id)
+                roi_u8   = roi_comp.astype(np.uint8) * 255
+                dist     = cv2.distanceTransform(roi_u8, cv2.DIST_L2, 5)
+                max_r    = float(dist.max())
+                if fg_bin is not None:
+                    roi_fg = fg_bin[y0:y1, x0:x1]
+                    in_fg  = bool((roi_comp & roi_fg).sum() > roi_comp.sum() * 0.5)
+                else:
+                    in_fg = False
+                threshold = min_radius_px * (fg_radius_scale if in_fg else 1.0)
+                if max_r >= threshold:
+                    color_has_survivor = True
+                else:
+                    tiny_list.append((color_key, y0, y1, x0, x1, label_id))
+            if color_has_survivor:
+                surviving_colors.add(color_key)
+
+        if not tiny_list:
+            return
+
+        if not surviving_colors:
+            print("  → 小色塊合併：所有元件都太小，跳過")
+            return
+
+        surv_colors = np.array([list(c) for c in surviving_colors], dtype=np.float32)
+
+        # 第二遍：對每個待合併元件，重新找 label → 替換成最近存活顏色
+        merged_blocks = 0
+        merged_pixels = 0
+        for color_key, y0, y1, x0, x1, label_id in tiny_list:
+            color_arr   = np.array(list(color_key), dtype=np.uint8)
+            roi_img     = img[y0:y1, x0:x1]
+            comp_mask   = np.all(roi_img == color_arr, axis=2)
+            if not comp_mask.any():
+                continue  # 已被先前合併覆蓋
+            nearest_idx   = np.argmin(np.linalg.norm(surv_colors - color_arr.astype(np.float32), axis=1))
+            nearest_color = surv_colors[nearest_idx].astype(np.uint8)
+            result[y0:y1, x0:x1][comp_mask] = nearest_color
+            merged_blocks += 1
+            merged_pixels += int(comp_mask.sum())
+
+        self.setImage(result)
+        print(f"  → 小色塊合併：{merged_blocks} 個色塊 / {merged_pixels} px"
+              f"（幾何門檻 r>={min_radius_px:.1f}px，fg 縮小至 {min_radius_px * fg_radius_scale:.1f}px）")
 
     def apply_weighted_region(self, mask: np.ndarray, total_colors: int,
                                weight_ratio: float = 0.65,
@@ -1027,7 +1057,7 @@ class PbnGen:
         bg_count = len(bg_idx[0])
 
         if fg_count == 0 or bg_count == 0:
-            print("⚠️ 遮罩區域異常，跳過 weighted 處理")
+            print("[!] 遮罩區域異常，跳過 weighted 處理")
             return
 
         fg_colors = max(1, round(total_colors * weight_ratio))
@@ -1077,7 +1107,7 @@ class PbnGen:
         result[fg_idx] = fg_new
         result[bg_idx] = bg_new
         self.setImage(result.astype(np.uint8))
-        print(f"✅ weighted_region 完成")
+        print(f"[OK] weighted_region 完成")
 
     def set_final_pbn(self, blur_ksize=21, blur_sigma_color=21, blur_sigma_space=14, prune_iterations=6):
         """
@@ -1130,45 +1160,54 @@ class PbnGen:
         return d + " Z"
 
     @staticmethod
-    def _smooth_masks_for_svg(quantized_rgb, color_masks, blur_ksize=5):
+    def _smooth_quantized(quantized_rgb, color_masks, blur_ksize=5):
         """
-        對量化圖做 median blur 後 snap 回調色盤顏色，
-        讓相鄰色塊共用同一條邊界（消除鋸齒 + 消除 gap）。
-        只用於 SVG 輪廓計算，不修改實際量化結果。
+        對量化圖做 median blur 後 snap 回調色盤，回傳：
+          - snapped_rgb：平滑後的 RGB 圖（與 filled.png 一致）
+          - smoothed_masks：各色的平滑遮罩（用於 SVG 輪廓）
+        同時用於 SVG 和 filled.png，保證兩者一致。
         """
         q_bgr = cv2.cvtColor(quantized_rgb, cv2.COLOR_RGB2BGR)
         q_blurred = cv2.medianBlur(q_bgr, blur_ksize)
         q_blurred_rgb = cv2.cvtColor(q_blurred, cv2.COLOR_BGR2RGB)
 
-        # 調色盤顏色陣列
         palette_colors = np.array([list(c) for c in color_masks.keys()], dtype=np.float32)
         h, w = quantized_rgb.shape[:2]
         flat = q_blurred_rgb.reshape(-1, 3).astype(np.float32)
 
-        # 每個像素 snap 回最近的調色盤顏色（RGB 歐氏距離）
         dists = np.sum((flat[:, None, :] - palette_colors[None, :, :]) ** 2, axis=2)
         nearest = np.argmin(dists, axis=1)
         snapped = palette_colors[nearest].reshape(h, w, 3).astype(np.uint8)
 
-        # 從 snapped 圖重建各色遮罩
         smoothed_masks = {}
         for color_key in color_masks.keys():
             color_arr = np.array(list(color_key), dtype=np.uint8)
             mask_bool = np.all(snapped == color_arr, axis=2)
             smoothed_masks[color_key] = np.stack([mask_bool] * 3, axis=2)
 
-        return smoothed_masks
+        return snapped, smoothed_masks
 
-    def output_to_svg(self, svg_path: str, output_palette_path: str = None):
+    def output_to_svg(self, svg_path: str, output_palette_path: str = None,
+                      min_radius_px: float = 6.0):
+        """
+        min_radius_px: 來自 calc_min_radius_px × multiplier，與 merge_tiny_colors 一致。
+        輪廓面積門檻 = π × min_radius_px²（對應 0.2cm 最小可繪製直徑）。
+        """
+        import math
+        min_contour_area = max(4, math.pi * min_radius_px ** 2)
         h, w = self.getImage().shape[:2]
         dwg = svgwrite.Drawing(svg_path, profile="tiny", viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
 
-        # 對量化圖預平滑後重建遮罩 → 相鄰色塊共用邊界，消除鋸齒與 gap
-        smoothed_masks = self._smooth_masks_for_svg(self.getImage(), color_masks, blur_ksize=5)
+        # median blur + snap → 相鄰色塊共用邊界（消除鋸齒/gap）
+        # snapped_rgb 同步存到 self._snapped_rgb，供 output_filled_image 使用
+        snapped_rgb, smoothed_masks = self._smooth_quantized(
+            self.getImage(), color_masks, blur_ksize=5
+        )
+        # snapped_rgb 用於 smoothed_masks 的遮罩計算（輪廓邊界對齊）
+        # filled.png 來源改為光柵化 template 輪廓後設定（見下方 template_rgb）
 
-        # 單遍渲染：fill + stroke 用同一個輪廓（stroke 覆蓋接縫）
         all_contours = []
         for idx, (color, mask) in enumerate(color_masks.items()):
             smooth_mask = smoothed_masks.get(color, mask)
@@ -1178,10 +1217,12 @@ class PbnGen:
             )
             for c in contours:
                 area = cv2.contourArea(c)
-                if area >= 4 and len(c) >= 3:
+                if area >= 1 and len(c) >= 3:  # 只排除退化輪廓，merge_tiny_colors 已處理可繪性
                     all_contours.append((area, idx, color, c))
 
         all_contours.sort(key=lambda x: x[0], reverse=True)
+
+        self._snapped_rgb = snapped_rgb  # filled.png 直接用 smoothed snapped 圖
 
         # 建立這幅畫的 1~N 專屬編號（面積最大的顏色得 #1）
         color_to_seq = {}
@@ -1210,21 +1251,35 @@ class PbnGen:
             }
         palette = list(palette_map.values())
 
-        # 單遍：fill（白底 + 25% 提示色）+ stroke（黑邊）同一 polygon
+        # 背景白底（保證無空隙透出）
+        dwg.add(dwg.rect((0, 0), (w, h), fill="white"))
+
+        # Pass 1：全部填色（無 stroke）→ 面積大先畫，確保完整覆蓋
         for area, idx, color, c in all_contours:
             color_fill = "rgb({},{},{})".format(int(color[0]), int(color[1]), int(color[2]))
             points = c.squeeze().tolist()
             if len(c.squeeze().shape) == 1:
                 points = [points]
+            dwg.add(dwg.polygon(points, fill="white", stroke="none"))
+            dwg.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
+
+        # Pass 2：同一批輪廓，只畫 stroke + 數字（不影響填色）
+        placed_labels = []  # 已放置標籤 [(cx, cy, font_size)]，用於碰撞避讓
+        for area, idx, color, c in all_contours:
+            points = c.squeeze().tolist()
+            if len(c.squeeze().shape) == 1:
+                points = [points]
 
             group = dwg.g(id=str(i))
-            group.add(dwg.polygon(points, fill="white", stroke="black", stroke_width="1",
+            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width="1",
                                   stroke_linejoin="round", stroke_linecap="round"))
-            group.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
-            text = self.add_text_label(dwg, c, label)
-            group.add(text)
+            color_mask = smoothed_masks.get(color)
+            text = self.add_text_label(dwg, c, label, color_mask=color_mask,
+                                       placed_labels=placed_labels)
+            if text is not None:
+                group.add(text)
             dwg.add(group)
 
             palette[idx]["shapes"].append(str(i))
@@ -1241,10 +1296,11 @@ class PbnGen:
 
     def output_filled_image(self, output_path: str, border: bool = False):
         """
-        輸出填色完成效果圖：直接輸出量化後的影像，每個像素已有正確顏色，不需重繪輪廓。
-        border: 是否疊加黑色輪廓線（預設 False）。
+        輸出填色完成效果圖。
+        使用與 template 相同的 smoothed 資料（output_to_svg 執行後設定 _snapped_rgb），
+        確保 filled 只呈現 template 上存在的格子與顏色。
         """
-        filled_rgb = self.getImage().copy()
+        filled_rgb = getattr(self, '_snapped_rgb', self.getImage()).copy()
 
         if border:
             color_masks = self.getUniqueColorsMasks()
@@ -1264,54 +1320,110 @@ class PbnGen:
                 f.write(buf.tobytes())
             print(f"填色效果圖已儲存至: {output_path}")
         else:
-            print(f"❌ 填色效果圖編碼失敗: {output_path}")
+            print(f"[ERR] 填色效果圖編碼失敗: {output_path}")
 
     def point_inside_contour(self, point, contour):
         """Check if a point is inside a contour."""
         return cv2.pointPolygonTest(contour, (point[0], point[1]), False) >= 0
 
-    def sample_text_position(self, contour, num_samples=150):
-        if len(contour) < 4:
-            # Not enough points to form a polygon return the centroid or the first point of the contour
-            moments = cv2.moments(contour)
-            if moments["m00"] != 0:
-                return (
-                    int(moments["m10"] / moments["m00"]),
-                    int(moments["m01"] / moments["m00"]),
-                )
+    def _label_position_from_mask(self, contour, color_mask_3ch,
+                                   placed_labels=None, font_size=8.0):
+        """
+        找文字放置位置：distanceTransform argmax（最大內切圓圓心）。
+        placed_labels: list of (cx, cy, font_size)，已放置的標籤位置。
+        若最佳點與已有標籤衝突，往下找次優峰值（最多嘗試 5 次）。
+        全部衝突時回傳 None（跳過這個標籤）。
+        """
+        color_mask = color_mask_3ch[:, :, 0]
+        x, y, bw, bh = cv2.boundingRect(contour)
+        if bw == 0 or bh == 0:
+            return None
+
+        # 輪廓填充遮罩（bounding rect 內）
+        roi_contour = np.zeros((bh, bw), dtype=np.uint8)
+        shifted = contour - np.array([[[x, y]]])
+        cv2.drawContours(roi_contour, [shifted], -1, 255, cv2.FILLED)
+
+        # 只取輪廓內且屬於此顏色的像素
+        roi_color = color_mask[y:y+bh, x:x+bw].astype(np.uint8)
+        valid_mask = ((roi_contour > 0) & (roi_color > 0)).astype(np.uint8) * 255
+
+        if valid_mask.sum() == 0:
+            m = cv2.moments(contour)
+            if m["m00"] != 0:
+                return (m["m10"] / m["m00"], m["m01"] / m["m00"])
+            return None
+
+        # distanceTransform：每個有效像素到最近邊界的距離
+        dist = cv2.distanceTransform(valid_mask, cv2.DIST_L2, 5)
+        dist_work = dist.copy()
+
+        for _ in range(5):
+            _, max_val, _, max_loc = cv2.minMaxLoc(dist_work)
+            if max_val < 0.5:
+                break  # 沒有有效位置
+
+            cx = float(max_loc[0] + x)
+            cy = float(max_loc[1] + y)
+
+            # 碰撞偵測：與已放置標籤的距離 < 兩字體大小之和
+            conflict = False
+            if placed_labels:
+                for px, py, pfs in placed_labels:
+                    min_dist = font_size + pfs
+                    if (cx - px) ** 2 + (cy - py) ** 2 < min_dist * min_dist:
+                        conflict = True
+                        break
+
+            if not conflict:
+                return (cx, cy)
+
+            # 抑制這個峰值附近，搜尋下一個
+            r = max(1, int(font_size))
+            r0 = max(0, max_loc[1] - r); r1 = min(bh, max_loc[1] + r + 1)
+            c0 = max(0, max_loc[0] - r); c1 = min(bw, max_loc[0] + r + 1)
+            dist_work[r0:r1, c0:c1] = 0
+
+        return None  # 所有候選位置都衝突 → 跳過
+
+    def add_text_label(self, dwg, contour, label, color_mask=None, placed_labels=None):
+        area = cv2.contourArea(contour)
+        if area < 100:
+            return None
+
+        # 字體大小依面積決定，最小 4px，最大 12px
+        text_size = float(np.clip(area ** 0.5 / 8, 4, 12))
+
+        if color_mask is not None:
+            pos = self._label_position_from_mask(
+                contour, color_mask,
+                placed_labels=placed_labels,
+                font_size=text_size
+            )
+        else:
+            pos = None
+
+        if pos is None:
+            # fallback：輪廓重心（不做碰撞偵測，至少保留一個數字）
+            m = cv2.moments(contour)
+            if m["m00"] != 0:
+                pos = (m["m10"] / m["m00"], m["m01"] / m["m00"])
             else:
-                return (0, 0)
+                pos = (float(contour[0][0][0]), float(contour[0][0][1]))
+            # fallback 仍需碰撞檢查，若衝突則跳過
+            if placed_labels:
+                for px, py, pfs in placed_labels:
+                    min_dist = text_size + pfs
+                    if (pos[0]-px)**2 + (pos[1]-py)**2 < min_dist * min_dist:
+                        return None  # 連 fallback 也衝突 → 跳過
 
-        # Convert contour to a shapely polygon for area computation
-        polygon = Polygon([pt[0] for pt in contour])
-        min_x, min_y, max_x, max_y = polygon.bounds
-        best_point = (0, 0)
-        max_distance = -1
+        # 記錄已放置位置
+        if placed_labels is not None and pos is not None:
+            placed_labels.append((pos[0], pos[1], text_size))
 
-        for _ in range(num_samples):
-            x, y = random.uniform(min_x, max_x), random.uniform(min_y, max_y)
-            point = Point(x, y)
-
-            # Check if the sampled point is within the polygon and its distance to edges
-            if polygon.contains(point):
-                distance = polygon.exterior.distance(point)
-                if distance > max_distance:
-                    max_distance = distance
-                    best_point = (x, y)
-
-        return best_point
-
-    def add_text_label(self, dwg, contour, label):
-        best_point = self.sample_text_position(contour)
-
-        # Estimate a suitable text size
-        text_size = np.clip(np.sqrt(cv2.contourArea(contour)) / 8, 4, 12)
-
-        text = dwg.text(
+        return dwg.text(
             label,
-            insert=best_point,
+            insert=pos,
             font_size=str(text_size),
             text_anchor="middle",
         )
-        return text
-        # dwg.add(text)
