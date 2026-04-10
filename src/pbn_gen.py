@@ -1099,26 +1099,88 @@ class PbnGen:
         img = cv2.rectangle(img, (0, 0), (img.shape[1], img.shape[0]), (0, 0, 0), 10)
         self.setImage(img)
 
+    @staticmethod
+    def _contour_to_bezier_path(contour, tension: float = 0.3) -> str:
+        """
+        將輪廓點轉成 SVG Catmull-Rom Bezier 路徑字串。
+        tension: 0 = 直線, 0.5 = 標準 Catmull-Rom, 建議 0.2~0.4
+        """
+        pts = contour.squeeze()
+        if len(pts.shape) == 1:
+            pts = pts.reshape(1, 2)
+        n = len(pts)
+        if n < 3:
+            # 點太少，退回直線
+            d = f"M {pts[0][0]},{pts[0][1]}"
+            for p in pts[1:]:
+                d += f" L {p[0]},{p[1]}"
+            return d + " Z"
+
+        def p(i):
+            return pts[i % n].astype(float)
+
+        d = f"M {p(0)[0]:.2f},{p(0)[1]:.2f}"
+        for i in range(n):
+            p0, p1, p2, p3 = p(i - 1), p(i), p(i + 1), p(i + 2)
+            cp1 = p1 + (p2 - p0) * tension
+            cp2 = p2 - (p3 - p1) * tension
+            d += (f" C {cp1[0]:.2f},{cp1[1]:.2f}"
+                  f" {cp2[0]:.2f},{cp2[1]:.2f}"
+                  f" {p2[0]:.2f},{p2[1]:.2f}")
+        return d + " Z"
+
+    @staticmethod
+    def _smooth_masks_for_svg(quantized_rgb, color_masks, blur_ksize=5):
+        """
+        對量化圖做 median blur 後 snap 回調色盤顏色，
+        讓相鄰色塊共用同一條邊界（消除鋸齒 + 消除 gap）。
+        只用於 SVG 輪廓計算，不修改實際量化結果。
+        """
+        q_bgr = cv2.cvtColor(quantized_rgb, cv2.COLOR_RGB2BGR)
+        q_blurred = cv2.medianBlur(q_bgr, blur_ksize)
+        q_blurred_rgb = cv2.cvtColor(q_blurred, cv2.COLOR_BGR2RGB)
+
+        # 調色盤顏色陣列
+        palette_colors = np.array([list(c) for c in color_masks.keys()], dtype=np.float32)
+        h, w = quantized_rgb.shape[:2]
+        flat = q_blurred_rgb.reshape(-1, 3).astype(np.float32)
+
+        # 每個像素 snap 回最近的調色盤顏色（RGB 歐氏距離）
+        dists = np.sum((flat[:, None, :] - palette_colors[None, :, :]) ** 2, axis=2)
+        nearest = np.argmin(dists, axis=1)
+        snapped = palette_colors[nearest].reshape(h, w, 3).astype(np.uint8)
+
+        # 從 snapped 圖重建各色遮罩
+        smoothed_masks = {}
+        for color_key in color_masks.keys():
+            color_arr = np.array(list(color_key), dtype=np.uint8)
+            mask_bool = np.all(snapped == color_arr, axis=2)
+            smoothed_masks[color_key] = np.stack([mask_bool] * 3, axis=2)
+
+        return smoothed_masks
+
     def output_to_svg(self, svg_path: str, output_palette_path: str = None):
         h, w = self.getImage().shape[:2]
         dwg = svgwrite.Drawing(svg_path, profile="tiny", viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
 
-        # 收集所有輪廓，記錄面積
+        # 對量化圖預平滑後重建遮罩 → 相鄰色塊共用邊界，消除鋸齒與 gap
+        smoothed_masks = self._smooth_masks_for_svg(self.getImage(), color_masks, blur_ksize=5)
+
+        # 單遍渲染：fill + stroke 用同一個輪廓（stroke 覆蓋接縫）
         all_contours = []
         for idx, (color, mask) in enumerate(color_masks.items()):
-            mask_uint8 = np.all(mask, axis=2).astype(np.uint8) * 255
+            smooth_mask = smoothed_masks.get(color, mask)
+            mask_uint8 = np.all(smooth_mask, axis=2).astype(np.uint8) * 255
             contours, _ = cv2.findContours(
-                mask_uint8,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_TC89_KCOS,
+                mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
             )
             for c in contours:
                 area = cv2.contourArea(c)
-                all_contours.append((area, idx, color, c))
+                if area >= 4 and len(c) >= 3:
+                    all_contours.append((area, idx, color, c))
 
-        # 面積大的先畫 → 小色塊後畫疊上去，不會被蓋掉
         all_contours.sort(key=lambda x: x[0], reverse=True)
 
         # 建立這幅畫的 1~N 專屬編號（面積最大的顏色得 #1）
@@ -1133,11 +1195,9 @@ class PbnGen:
         for idx, (color, mask) in enumerate(color_masks.items()):
             key = tuple(int(v) for v in color)
             seq_num = color_to_seq.get(key, idx + 1)
-            
-            # 計算原始 60 色中的號碼 (Master ID)
+
             master_id = "N/A"
             if self.fixed_palette is not None:
-                # 尋找這個 RGB 在原始 60 色陣列中的索引
                 match = np.where((self.fixed_palette == color).all(axis=1))[0]
                 if len(match) > 0:
                     master_id = int(match[0] + 1)
@@ -1150,20 +1210,17 @@ class PbnGen:
             }
         palette = list(palette_map.values())
 
+        # 單遍：fill（白底 + 25% 提示色）+ stroke（黑邊）同一 polygon
         for area, idx, color, c in all_contours:
+            color_fill = "rgb({},{},{})".format(int(color[0]), int(color[1]), int(color[2]))
             points = c.squeeze().tolist()
             if len(c.squeeze().shape) == 1:
                 points = [points]
 
-            color_fill = "rgb({},{},{})".format(int(color[0]), int(color[1]), int(color[2]))
             group = dwg.g(id=str(i))
-
-            # 第一層：白色不透明底 + 1px 黑色邊線
-            group.add(dwg.polygon(points, fill="white", stroke="black", stroke_width="1"))
-            # 第二層：25% 透明提示色，不加邊線
+            group.add(dwg.polygon(points, fill="white", stroke="black", stroke_width="1",
+                                  stroke_linejoin="round", stroke_linecap="round"))
             group.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
-
-            # 數字標籤
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
             text = self.add_text_label(dwg, c, label)
