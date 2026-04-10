@@ -1271,7 +1271,7 @@ class PbnGen:
                 points = [points]
 
             group = dwg.g(id=str(i))
-            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width="1",
+            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width="0.1",
                                   stroke_linejoin="round", stroke_linecap="round"))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
@@ -1388,37 +1388,30 @@ class PbnGen:
 
     def add_text_label(self, dwg, contour, label, color_mask=None, placed_labels=None):
         area = cv2.contourArea(contour)
-        if area < 100:
+        if area < 1:
             return None
 
-        # 字體大小依面積決定，最小 4px，最大 12px
-        text_size = float(np.clip(area ** 0.5 / 8, 4, 12))
+        # 字體大小依面積決定，最小 3px，最大 12px
+        text_size = float(np.clip(area ** 0.5 / 8, 3, 12))
 
+        pos = None
         if color_mask is not None:
             pos = self._label_position_from_mask(
                 contour, color_mask,
                 placed_labels=placed_labels,
                 font_size=text_size
             )
-        else:
-            pos = None
 
         if pos is None:
-            # fallback：輪廓重心（不做碰撞偵測，至少保留一個數字）
+            # fallback：輪廓重心，一定放（不因碰撞跳過，保證每格都有數字）
             m = cv2.moments(contour)
             if m["m00"] != 0:
                 pos = (m["m10"] / m["m00"], m["m01"] / m["m00"])
             else:
                 pos = (float(contour[0][0][0]), float(contour[0][0][1]))
-            # fallback 仍需碰撞檢查，若衝突則跳過
-            if placed_labels:
-                for px, py, pfs in placed_labels:
-                    min_dist = text_size + pfs
-                    if (pos[0]-px)**2 + (pos[1]-py)**2 < min_dist * min_dist:
-                        return None  # 連 fallback 也衝突 → 跳過
 
         # 記錄已放置位置
-        if placed_labels is not None and pos is not None:
+        if placed_labels is not None:
             placed_labels.append((pos[0], pos[1], text_size))
 
         return dwg.text(
