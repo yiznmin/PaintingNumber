@@ -1188,41 +1188,73 @@ class PbnGen:
         return snapped, smoothed_masks
 
     @staticmethod
-    def _boundary_svg_path(snapped_rgb: np.ndarray) -> str:
+    @staticmethod
+    def _boundary_svg_path(snapped_rgb: np.ndarray, dp_epsilon: float = 0.7) -> str:
         """
         從 snapped_rgb 計算色塊邊界，輸出 SVG path d 字串。
-        每條邊界只畫一次（位於像素邊上），避免相鄰輪廓重疊造成雙線。
+        每條邊只畫一次（在像素邊上，避免雙線）。
+        用 Douglas-Peucker (epsilon=dp_epsilon px) 把階梯狀鋸齒化成對角直線。
         """
+        from collections import defaultdict
         h, w = snapped_rgb.shape[:2]
+
+        adj = defaultdict(list)
+
+        # 垂直邊界：左右相鄰像素顏色不同 → 邊在 x=c+1
+        hmask = np.any(snapped_rgb[:, 1:] != snapped_rgb[:, :-1], axis=2)
+        for yi, xi in zip(*[a.tolist() for a in np.where(hmask)]):
+            p1, p2 = (xi + 1, yi), (xi + 1, yi + 1)
+            adj[p1].append(p2)
+            adj[p2].append(p1)
+
+        # 水平邊界：上下相鄰像素顏色不同 → 邊在 y=r+1
+        vmask = np.any(snapped_rgb[1:, :] != snapped_rgb[:-1, :], axis=2)
+        for yi, xi in zip(*[a.tolist() for a in np.where(vmask)]):
+            p1, p2 = (xi, yi + 1), (xi + 1, yi + 1)
+            adj[p1].append(p2)
+            adj[p2].append(p1)
+
+        def dp(pts, eps):
+            if len(pts) <= 2:
+                return pts
+            x0, y0 = pts[0];  x1, y1 = pts[-1]
+            dx, dy = x1 - x0, y1 - y0
+            dlen = (dx * dx + dy * dy) ** 0.5
+            max_d, max_i = 0.0, 1
+            for k in range(1, len(pts) - 1):
+                xk, yk = pts[k]
+                d = (abs(dy * xk - dx * yk + x1 * y0 - y1 * x0) / dlen
+                     if dlen > 1e-9 else ((xk-x0)**2+(yk-y0)**2)**0.5)
+                if d > max_d:
+                    max_d, max_i = d, k
+            if max_d > eps:
+                return dp(pts[:max_i + 1], eps)[:-1] + dp(pts[max_i:], eps)
+            return [pts[0], pts[-1]]
+
+        visited = set()
         parts = []
 
-        # 垂直邊（左右相鄰像素顏色不同）→ 邊界是 x=c+1 的垂直線段
-        hmask = ~np.all(snapped_rgb[:, 1:] == snapped_rgb[:, :-1], axis=2)
-        for c in range(w - 1):
-            col = hmask[:, c]
-            r = 0
-            while r < h:
-                if col[r]:
-                    r0 = r
-                    while r < h and col[r]:
-                        r += 1
-                    parts.append(f"M{c+1} {r0}L{c+1} {r}")
-                else:
-                    r += 1
+        for start in adj:
+            if start in visited:
+                continue
+            chain = [start]
+            visited.add(start)
+            curr = start
+            while True:
+                nxt = next((nb for nb in adj[curr] if nb not in visited), None)
+                if nxt is None:
+                    break
+                chain.append(nxt)
+                visited.add(nxt)
+                curr = nxt
 
-        # 水平邊（上下相鄰像素顏色不同）→ 邊界是 y=r+1 的水平線段
-        vmask = ~np.all(snapped_rgb[1:, :] == snapped_rgb[:-1, :], axis=2)
-        for r in range(h - 1):
-            row = vmask[r, :]
-            c = 0
-            while c < w:
-                if row[c]:
-                    c0 = c
-                    while c < w and row[c]:
-                        c += 1
-                    parts.append(f"M{c0} {r+1}L{c} {r+1}")
-                else:
-                    c += 1
+            if len(chain) < 2:
+                continue
+            simp = dp(chain, eps=dp_epsilon)
+            segs = [f"M{simp[0][0]} {simp[0][1]}"]
+            for pt in simp[1:]:
+                segs.append(f"L{pt[0]} {pt[1]}")
+            parts.append("".join(segs))
 
         return " ".join(parts)
 
@@ -1321,7 +1353,7 @@ class PbnGen:
             dwg.add(dwg.polygon(points, fill="white", stroke="none"))
             dwg.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
 
-        # Pass 2：數字標籤（stroke 改由像素邊界單獨畫，不在 polygon 上）
+        # Pass 2：數字標籤（線條由 Pass 3 的邊界路徑統一繪製）
         placed_labels = []
         for area, idx, color, c in all_contours:
             group = dwg.g(id=str(i))
@@ -1334,16 +1366,14 @@ class PbnGen:
             if text is not None:
                 group.add(text)
             dwg.add(group)
-
             palette[idx]["shapes"].append(str(i))
             i += 1
 
-        # Pass 3：像素邊界線（每條邊只畫一次，位置在像素邊上避免雙線）
-        # 用 mm 物理單位確保 SVG 瀏覽器與 PDF 轉換一致
+        # Pass 3：邊界路徑（每條邊只畫一次，DP 平滑，mm 物理單位）
         bnd_d = self._boundary_svg_path(snapped_rgb)
         dwg.add(dwg.path(d=bnd_d, fill="none", stroke="black",
                          stroke_width=f"{stroke_mm:.3f}mm",
-                         stroke_linecap="square", stroke_linejoin="miter"))
+                         stroke_linecap="round", stroke_linejoin="round"))
 
         dwg.save()
         print(f"{i} shapes")
