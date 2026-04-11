@@ -20,7 +20,7 @@ from pbn_gen import PbnGen
 
 # ── 設定區（只需改這裡）────────────────────────────────
 NAME         = "Mom"
-STYLE_TAGS   = ["人物","自拍","卡通版"]
+STYLE_TAGS   = ["人物","自拍","卡通"]
 MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
 
 # sam_refine 參數
@@ -45,25 +45,15 @@ STATS_PATH     = os.path.join(OUTPUT_BASE, "color_stats.json")
 # 所有支援的畫布規格（寬, 高），單位公分
 _STANDARD_SIZES = [
     # 正方形
-    (30, 30), (40, 40), (50, 50), (60, 60), (70, 70), (80, 80), (100, 100),
+    (20, 20), (30, 30), (40, 40), (50, 50), (60, 60),
     # 直幅
-    (30, 40), (30, 50),
+    (30, 40), (30, 50), (30, 60),
     (40, 50), (40, 60),
-    (50, 60), (50, 70),
-    (60, 80), (60, 90), (60, 120),
-    (70, 90), (70, 100),
-    (80, 100), (80, 120),
-    (90, 120),
-    (100, 150),
-    # 橫幅（直幅翻轉）
-    (40, 30), (50, 30),
+    (50, 60),
+    # 橫幅
+    (40, 30), (50, 30), (60, 30),
     (50, 40), (60, 40),
-    (60, 50), (70, 50),
-    (80, 60), (90, 60), (120, 60),
-    (90, 70), (100, 70),
-    (100, 80), (120, 80),
-    (120, 90),
-    (150, 100),
+    (60, 50),
 ]
 
 
@@ -300,8 +290,12 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
     filled_path = os.path.join(level_dir, "filled.png")
     json_path   = os.path.join(level_dir, "palette.json")
 
-    palette_data = pbn.output_to_svg(svg_path, json_path, min_radius_px=min_radius_px)
+    palette_data = pbn.output_to_svg(svg_path, json_path,
+                                     min_radius_px=min_radius_px,
+                                     canvas_w_cm=canvas_cm[0])
     pbn.output_filled_image(filled_path)
+    template_png_path = os.path.join(level_dir, "template.png")
+    pbn.output_template_png(template_png_path)
 
     # ── 顏色佔比分析 ─────────────────────────────────────────────────
     filled_img = cv2.imdecode(

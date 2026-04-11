@@ -1188,14 +1188,25 @@ class PbnGen:
         return snapped, smoothed_masks
 
     def output_to_svg(self, svg_path: str, output_palette_path: str = None,
-                      min_radius_px: float = 6.0):
+                      min_radius_px: float = 6.0,
+                      canvas_w_cm: float = None,
+                      stroke_mm: float = 0.06):
         """
-        min_radius_px: 來自 calc_min_radius_px × multiplier，與 merge_tiny_colors 一致。
-        輪廓面積門檻 = π × min_radius_px²（對應 0.2cm 最小可繪製直徑）。
+        min_radius_px:  來自 calc_min_radius_px × multiplier，與 merge_tiny_colors 一致。
+        canvas_w_cm:    畫布實體寬度（公分），用於換算筆觸粗細。
+        stroke_mm:      目標線條粗細（毫米），換算成 SVG 用戶單位確保 PDF 一致。
         """
         import math
         min_contour_area = max(4, math.pi * min_radius_px ** 2)
         h, w = self.getImage().shape[:2]
+        # 換算線條粗細與字體最小值：目標毫米/公分 → SVG 用戶單位（像素）
+        if canvas_w_cm and canvas_w_cm > 0:
+            px_per_cm = w / canvas_w_cm
+            stroke_svg = stroke_mm * 0.1 * px_per_cm    # mm → cm → px
+            min_font_px = 0.2 * px_per_cm               # 0.2cm → px
+        else:
+            stroke_svg = 0.5
+            min_font_px = 3.0
         dwg = svgwrite.Drawing(svg_path, profile="tiny", viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
@@ -1271,13 +1282,14 @@ class PbnGen:
                 points = [points]
 
             group = dwg.g(id=str(i))
-            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width="0.1",
+            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width=str(round(stroke_svg, 3)),
                                   stroke_linejoin="round", stroke_linecap="round"))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
             color_mask = smoothed_masks.get(color)
             text = self.add_text_label(dwg, c, label, color_mask=color_mask,
-                                       placed_labels=placed_labels)
+                                       placed_labels=placed_labels,
+                                       min_font_px=min_font_px)
             if text is not None:
                 group.add(text)
             dwg.add(group)
@@ -1292,7 +1304,93 @@ class PbnGen:
             with open(output_palette_path, "w", encoding="utf-8") as outfile:
                 json.dump(palette, outfile, ensure_ascii=False, indent=2)
 
+        # 儲存供 output_template_png 使用
+        self._template_contours   = all_contours
+        self._template_color_seq  = color_to_seq
+        self._template_smoothed   = smoothed_masks
+        self._template_stroke_svg = stroke_svg
+        self._template_min_font   = min_font_px
+        self._template_canvas_w_cm = canvas_w_cm
+
         return palette
+
+    def output_template_png(self, output_path: str):
+        """
+        將 template.svg 的內容光柵化為 PNG：
+        白底 + 25% 提示色 + 黑色輪廓線 + 數字標籤。
+        必須在 output_to_svg 之後呼叫。
+        """
+        from PIL import Image, ImageDraw, ImageFont
+        if not hasattr(self, '_template_contours'):
+            print("[!] 請先呼叫 output_to_svg")
+            return
+
+        h, w = self.getImage().shape[:2]
+        canvas_w_cm = self._template_canvas_w_cm or 40.0
+        px_per_cm = w / canvas_w_cm
+        # 線寬與字體以 SVG 相同物理大小換算（以 300 DPI 輸出為基準）
+        line_w = max(1, int(round(self._template_stroke_svg)))
+        min_font_pt = max(6, int(round(self._template_min_font * 0.75)))  # px → pt 近似
+
+        img = Image.new("RGB", (w, h), (255, 255, 255))
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        all_contours  = self._template_contours
+        color_to_seq  = self._template_color_seq
+        smoothed_masks = self._template_smoothed
+
+        # Pass 1：25% 提示色填充
+        for area, idx, color, c in all_contours:
+            pts = c.squeeze().tolist()
+            if not isinstance(pts[0], (list, tuple)):
+                pts = [pts]
+            r, g, b = int(color[0]), int(color[1]), int(color[2])
+            flat = [coord for pt in pts for coord in pt]
+            if len(flat) >= 4:
+                draw.polygon(flat, fill=(r, g, b, 64))  # 25% opacity
+
+        # Pass 2：輪廓線
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        for area, idx, color, c in all_contours:
+            cv2.drawContours(img_cv, [c], -1, (0, 0, 0), thickness=line_w,
+                             lineType=cv2.LINE_AA)
+
+        img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img)
+
+        # Pass 3：數字標籤
+        try:
+            font = ImageFont.truetype("arial.ttf", min_font_pt)
+        except Exception:
+            font = ImageFont.load_default()
+
+        placed = []
+        for area, idx, color, c in all_contours:
+            key = tuple(int(v) for v in color)
+            label = str(color_to_seq.get(key, idx + 1))
+            sm = smoothed_masks.get(key)
+            if sm is None:
+                continue
+            text_px = float(np.clip(area ** 0.5 / 8, self._template_min_font,
+                                    max(self._template_min_font * 4, 12)))
+            font_pt = max(6, int(round(text_px * 0.75)))
+            try:
+                f = ImageFont.truetype("arial.ttf", font_pt)
+            except Exception:
+                f = font
+            pos = self._label_position_from_mask(c, sm, placed_labels=placed,
+                                                 font_size=text_px)
+            if pos is None:
+                m = cv2.moments(c)
+                if m["m00"] != 0:
+                    pos = (m["m10"] / m["m00"], m["m01"] / m["m00"])
+            if pos:
+                draw.text((pos[0], pos[1]), label, fill=(0, 0, 0), font=f, anchor="mm")
+                placed.append((pos[0], pos[1], text_px))
+
+        img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_path, img_bgr)
+        print(f"Template PNG saved: {output_path}")
 
     def output_filled_image(self, output_path: str, border: bool = False):
         """
@@ -1358,41 +1456,55 @@ class PbnGen:
         dist = cv2.distanceTransform(valid_mask, cv2.DIST_L2, 5)
         dist_work = dist.copy()
 
-        for _ in range(5):
+        best_pos = None      # 最佳不衝突位置
+        fallback_pos = None  # 萬不得已的備用位置（最大 dist 但衝突最輕）
+        fallback_overlap = float('inf')
+
+        for _ in range(15):  # 多試幾個候選點
             _, max_val, _, max_loc = cv2.minMaxLoc(dist_work)
             if max_val < 0.5:
-                break  # 沒有有效位置
+                break
 
             cx = float(max_loc[0] + x)
             cy = float(max_loc[1] + y)
 
-            # 碰撞偵測：與已放置標籤的距離 < 兩字體大小之和
-            conflict = False
+            # 碰撞偵測
+            max_overlap = 0.0
             if placed_labels:
                 for px, py, pfs in placed_labels:
                     min_dist = font_size + pfs
-                    if (cx - px) ** 2 + (cy - py) ** 2 < min_dist * min_dist:
-                        conflict = True
-                        break
+                    d2 = (cx - px) ** 2 + (cy - py) ** 2
+                    if d2 < min_dist * min_dist:
+                        overlap = min_dist - d2 ** 0.5
+                        max_overlap = max(max_overlap, overlap)
 
-            if not conflict:
-                return (cx, cy)
+            if max_overlap == 0:
+                best_pos = (cx, cy)
+                break  # 找到不衝突的位置
 
-            # 抑制這個峰值附近，搜尋下一個
-            r = max(1, int(font_size))
+            # 記錄衝突最小的備用位置
+            if max_overlap < fallback_overlap:
+                fallback_overlap = max_overlap
+                fallback_pos = (cx, cy)
+
+            # 抑制這個峰值附近區域
+            r = max(1, int(font_size * 0.5))
             r0 = max(0, max_loc[1] - r); r1 = min(bh, max_loc[1] + r + 1)
             c0 = max(0, max_loc[0] - r); c1 = min(bw, max_loc[0] + r + 1)
             dist_work[r0:r1, c0:c1] = 0
 
-        return None  # 所有候選位置都衝突 → 跳過
+        # 有不衝突位置就用，否則用衝突最小的備用位置
+        return best_pos if best_pos is not None else fallback_pos
 
-    def add_text_label(self, dwg, contour, label, color_mask=None, placed_labels=None):
+    def add_text_label(self, dwg, contour, label, color_mask=None, placed_labels=None,
+                       min_font_px: float = 3.0):
         area = cv2.contourArea(contour)
         if area < 1:
             return None
 
-        # 字體大小依面積決定，最小 3px，最大 12px
-        text_size = float(np.clip(area ** 0.5 / 8, 3, 12))
+        # 字體大小依面積決定，下限由 min_font_px（換算自 0.2cm）決定，上限 12px
+        max_font_px = max(min_font_px * 4, 12)
+        text_size = float(np.clip(area ** 0.5 / 8, min_font_px, max_font_px))
 
         pos = None
         if color_mask is not None:
@@ -1402,13 +1514,28 @@ class PbnGen:
                 font_size=text_size
             )
 
+        # fallback：輪廓重心（極少觸發，僅當遮罩完全無效時）
         if pos is None:
-            # fallback：輪廓重心，一定放（不因碰撞跳過，保證每格都有數字）
             m = cv2.moments(contour)
             if m["m00"] != 0:
-                pos = (m["m10"] / m["m00"], m["m01"] / m["m00"])
+                cx = m["m10"] / m["m00"]
+                cy = m["m01"] / m["m00"]
             else:
-                pos = (float(contour[0][0][0]), float(contour[0][0][1]))
+                cx = float(contour[0][0][0])
+                cy = float(contour[0][0][1])
+            # 碰撞檢查：找衝突最小的偏移點
+            pos = (cx, cy)
+            if placed_labels:
+                best_overlap = float('inf')
+                for dx, dy in [(0,0),(text_size,0),(-text_size,0),(0,text_size),(0,-text_size)]:
+                    tx, ty = cx + dx, cy + dy
+                    overlap = max(
+                        (text_size + pfs) - ((tx-px)**2 + (ty-py)**2)**0.5
+                        for px, py, pfs in placed_labels
+                    ) if placed_labels else 0
+                    if overlap < best_overlap:
+                        best_overlap = overlap
+                        pos = (tx, ty)
 
         # 記錄已放置位置
         if placed_labels is not None:
