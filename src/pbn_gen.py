@@ -1187,13 +1187,54 @@ class PbnGen:
 
         return snapped, smoothed_masks
 
+    @staticmethod
+    def _boundary_svg_path(snapped_rgb: np.ndarray) -> str:
+        """
+        從 snapped_rgb 計算色塊邊界，輸出 SVG path d 字串。
+        每條邊界只畫一次（位於像素邊上），避免相鄰輪廓重疊造成雙線。
+        """
+        h, w = snapped_rgb.shape[:2]
+        parts = []
+
+        # 垂直邊（左右相鄰像素顏色不同）→ 邊界是 x=c+1 的垂直線段
+        hmask = ~np.all(snapped_rgb[:, 1:] == snapped_rgb[:, :-1], axis=2)
+        for c in range(w - 1):
+            col = hmask[:, c]
+            r = 0
+            while r < h:
+                if col[r]:
+                    r0 = r
+                    while r < h and col[r]:
+                        r += 1
+                    parts.append(f"M{c+1} {r0}L{c+1} {r}")
+                else:
+                    r += 1
+
+        # 水平邊（上下相鄰像素顏色不同）→ 邊界是 y=r+1 的水平線段
+        vmask = ~np.all(snapped_rgb[1:, :] == snapped_rgb[:-1, :], axis=2)
+        for r in range(h - 1):
+            row = vmask[r, :]
+            c = 0
+            while c < w:
+                if row[c]:
+                    c0 = c
+                    while c < w and row[c]:
+                        c += 1
+                    parts.append(f"M{c0} {r+1}L{c} {r+1}")
+                else:
+                    c += 1
+
+        return " ".join(parts)
+
     def output_to_svg(self, svg_path: str, output_palette_path: str = None,
                       min_radius_px: float = 6.0,
                       canvas_w_cm: float = None,
-                      stroke_mm: float = 0.06):
+                      canvas_h_cm: float = None,
+                      stroke_mm: float = 0.03):
         """
         min_radius_px:  來自 calc_min_radius_px × multiplier，與 merge_tiny_colors 一致。
         canvas_w_cm:    畫布實體寬度（公分），用於換算筆觸粗細。
+        canvas_h_cm:    畫布實體高度（公分），讓 SVG 攜帶正確物理尺寸供 PDF 轉換使用。
         stroke_mm:      目標線條粗細（毫米），換算成 SVG 用戶單位確保 PDF 一致。
         """
         import math
@@ -1204,10 +1245,16 @@ class PbnGen:
             px_per_cm = w / canvas_w_cm
             stroke_svg = stroke_mm * 0.1 * px_per_cm    # mm → cm → px
             min_font_px = 0.2 * px_per_cm               # 0.2cm → px
+            # 推算畫布高度（若未提供則從圖片比例推算）
+            _canvas_h = canvas_h_cm if (canvas_h_cm and canvas_h_cm > 0) \
+                        else canvas_w_cm * h / w
+            svg_size = (f"{canvas_w_cm}cm", f"{_canvas_h}cm")
         else:
             stroke_svg = 0.5
             min_font_px = 3.0
-        dwg = svgwrite.Drawing(svg_path, profile="tiny", viewBox=(f"0 0 {w} {h}"))
+            svg_size = (str(w), str(h))
+        dwg = svgwrite.Drawing(svg_path, profile="tiny",
+                               size=svg_size, viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
 
@@ -1274,16 +1321,10 @@ class PbnGen:
             dwg.add(dwg.polygon(points, fill="white", stroke="none"))
             dwg.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
 
-        # Pass 2：同一批輪廓，只畫 stroke + 數字（不影響填色）
-        placed_labels = []  # 已放置標籤 [(cx, cy, font_size)]，用於碰撞避讓
+        # Pass 2：數字標籤（stroke 改由像素邊界單獨畫，不在 polygon 上）
+        placed_labels = []
         for area, idx, color, c in all_contours:
-            points = c.squeeze().tolist()
-            if len(c.squeeze().shape) == 1:
-                points = [points]
-
             group = dwg.g(id=str(i))
-            group.add(dwg.polygon(points, fill="none", stroke="black", stroke_width=str(round(stroke_svg, 3)),
-                                  stroke_linejoin="round", stroke_linecap="round"))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
             color_mask = smoothed_masks.get(color)
@@ -1296,6 +1337,13 @@ class PbnGen:
 
             palette[idx]["shapes"].append(str(i))
             i += 1
+
+        # Pass 3：像素邊界線（每條邊只畫一次，位置在像素邊上避免雙線）
+        # 用 mm 物理單位確保 SVG 瀏覽器與 PDF 轉換一致
+        bnd_d = self._boundary_svg_path(snapped_rgb)
+        dwg.add(dwg.path(d=bnd_d, fill="none", stroke="black",
+                         stroke_width=f"{stroke_mm:.3f}mm",
+                         stroke_linecap="square", stroke_linejoin="miter"))
 
         dwg.save()
         print(f"{i} shapes")
@@ -1389,8 +1437,13 @@ class PbnGen:
                 placed.append((pos[0], pos[1], text_px))
 
         img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_path, img_bgr)
-        print(f"Template PNG saved: {output_path}")
+        success, buf = cv2.imencode(".png", img_bgr)
+        if success:
+            with open(output_path, "wb") as f:
+                f.write(buf.tobytes())
+            print(f"Template PNG saved: {output_path}")
+        else:
+            print(f"[ERR] template.png 編碼失敗: {output_path}")
 
     def output_filled_image(self, output_path: str, border: bool = False):
         """

@@ -292,10 +292,9 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
 
     palette_data = pbn.output_to_svg(svg_path, json_path,
                                      min_radius_px=min_radius_px,
-                                     canvas_w_cm=canvas_cm[0])
+                                     canvas_w_cm=canvas_cm[0],
+                                     canvas_h_cm=canvas_cm[1])
     pbn.output_filled_image(filled_path)
-    template_png_path = os.path.join(level_dir, "template.png")
-    pbn.output_template_png(template_png_path)
 
     # ── 顏色佔比分析 ─────────────────────────────────────────────────
     filled_img = cv2.imdecode(
