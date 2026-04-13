@@ -1124,10 +1124,6 @@ class PbnGen:
         self.cluster_colors_()
         self.pruneClustersSimple(iterations=prune_iterations)
         self.resizeImage_(dimension=originalDims)
-        # draw rectangle around image so border is recognized
-        img = self.getImage()
-        img = cv2.rectangle(img, (0, 0), (img.shape[1], img.shape[0]), (0, 0, 0), 10)
-        self.setImage(img)
 
     @staticmethod
     def _contour_to_bezier_path(contour, tension: float = 0.3) -> str:
@@ -1192,27 +1188,32 @@ class PbnGen:
     def _boundary_svg_path(snapped_rgb: np.ndarray, dp_epsilon: float = 0.7) -> str:
         """
         從 snapped_rgb 計算色塊邊界，輸出 SVG path d 字串。
-        每條邊只畫一次（在像素邊上，避免雙線）。
+        每條邊只畫一次，且只在「相同顏色對」之間連鏈——避免 junction 處跨色塊亂接。
         用 Douglas-Peucker (epsilon=dp_epsilon px) 把階梯狀鋸齒化成對角直線。
         """
         from collections import defaultdict
         h, w = snapped_rgb.shape[:2]
 
-        adj = defaultdict(list)
+        # 按顏色對分組：key = frozenset({c1, c2})，value = list of (p1, p2)
+        edges_by_pair = defaultdict(list)
 
-        # 垂直邊界：左右相鄰像素顏色不同 → 邊在 x=c+1
+        # 垂直邊界：左右相鄰像素顏色不同 → 邊在 x=xi+1
         hmask = np.any(snapped_rgb[:, 1:] != snapped_rgb[:, :-1], axis=2)
         for yi, xi in zip(*[a.tolist() for a in np.where(hmask)]):
-            p1, p2 = (xi + 1, yi), (xi + 1, yi + 1)
-            adj[p1].append(p2)
-            adj[p2].append(p1)
+            c1 = tuple(int(v) for v in snapped_rgb[yi, xi])
+            c2 = tuple(int(v) for v in snapped_rgb[yi, xi + 1])
+            edges_by_pair[frozenset((c1, c2))].append(
+                ((xi + 1, yi), (xi + 1, yi + 1))
+            )
 
-        # 水平邊界：上下相鄰像素顏色不同 → 邊在 y=r+1
+        # 水平邊界：上下相鄰像素顏色不同 → 邊在 y=yi+1
         vmask = np.any(snapped_rgb[1:, :] != snapped_rgb[:-1, :], axis=2)
         for yi, xi in zip(*[a.tolist() for a in np.where(vmask)]):
-            p1, p2 = (xi, yi + 1), (xi + 1, yi + 1)
-            adj[p1].append(p2)
-            adj[p2].append(p1)
+            c1 = tuple(int(v) for v in snapped_rgb[yi, xi])
+            c2 = tuple(int(v) for v in snapped_rgb[yi + 1, xi])
+            edges_by_pair[frozenset((c1, c2))].append(
+                ((xi, yi + 1), (xi + 1, yi + 1))
+            )
 
         def dp(pts, eps):
             if len(pts) <= 2:
@@ -1224,37 +1225,44 @@ class PbnGen:
             for k in range(1, len(pts) - 1):
                 xk, yk = pts[k]
                 d = (abs(dy * xk - dx * yk + x1 * y0 - y1 * x0) / dlen
-                     if dlen > 1e-9 else ((xk-x0)**2+(yk-y0)**2)**0.5)
+                     if dlen > 1e-9 else ((xk - x0) ** 2 + (yk - y0) ** 2) ** 0.5)
                 if d > max_d:
                     max_d, max_i = d, k
             if max_d > eps:
                 return dp(pts[:max_i + 1], eps)[:-1] + dp(pts[max_i:], eps)
             return [pts[0], pts[-1]]
 
-        visited = set()
         parts = []
 
-        for start in adj:
-            if start in visited:
-                continue
-            chain = [start]
-            visited.add(start)
-            curr = start
-            while True:
-                nxt = next((nb for nb in adj[curr] if nb not in visited), None)
-                if nxt is None:
-                    break
-                chain.append(nxt)
-                visited.add(nxt)
-                curr = nxt
+        for pair_edges in edges_by_pair.values():
+            # 在此顏色對內建立鄰接圖，chain traversal 不會跨色對
+            adj = defaultdict(list)
+            for p1, p2 in pair_edges:
+                adj[p1].append(p2)
+                adj[p2].append(p1)
 
-            if len(chain) < 2:
-                continue
-            simp = dp(chain, eps=dp_epsilon)
-            segs = [f"M{simp[0][0]} {simp[0][1]}"]
-            for pt in simp[1:]:
-                segs.append(f"L{pt[0]} {pt[1]}")
-            parts.append("".join(segs))
+            visited = set()
+            for start in list(adj.keys()):
+                if start in visited:
+                    continue
+                chain = [start]
+                visited.add(start)
+                curr = start
+                while True:
+                    nxt = next((nb for nb in adj[curr] if nb not in visited), None)
+                    if nxt is None:
+                        break
+                    chain.append(nxt)
+                    visited.add(nxt)
+                    curr = nxt
+
+                if len(chain) < 2:
+                    continue
+                simp = dp(chain, eps=dp_epsilon)
+                segs = [f"M{simp[0][0]} {simp[0][1]}"]
+                for pt in simp[1:]:
+                    segs.append(f"L{pt[0]} {pt[1]}")
+                parts.append("".join(segs))
 
         return " ".join(parts)
 
@@ -1262,7 +1270,7 @@ class PbnGen:
                       min_radius_px: float = 6.0,
                       canvas_w_cm: float = None,
                       canvas_h_cm: float = None,
-                      stroke_mm: float = 0.03):
+                      stroke_mm: float = 0.1):
         """
         min_radius_px:  來自 calc_min_radius_px × multiplier，與 merge_tiny_colors 一致。
         canvas_w_cm:    畫布實體寬度（公分），用於換算筆觸粗細。
@@ -1285,7 +1293,7 @@ class PbnGen:
             stroke_svg = 0.5
             min_font_px = 3.0
             svg_size = (str(w), str(h))
-        dwg = svgwrite.Drawing(svg_path, profile="tiny",
+        dwg = svgwrite.Drawing(svg_path, profile="full",
                                size=svg_size, viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
@@ -1298,16 +1306,17 @@ class PbnGen:
         # snapped_rgb 用於 smoothed_masks 的遮罩計算（輪廓邊界對齊）
         # filled.png 來源改為光柵化 template 輪廓後設定（見下方 template_rgb）
 
+        # contours 只用於標籤定位，不用於填色
         all_contours = []
         for idx, (color, mask) in enumerate(color_masks.items()):
             smooth_mask = smoothed_masks.get(color, mask)
             mask_uint8 = np.all(smooth_mask, axis=2).astype(np.uint8) * 255
             contours, _ = cv2.findContours(
-                mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
+                mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             for c in contours:
                 area = cv2.contourArea(c)
-                if area >= 1 and len(c) >= 3:  # 只排除退化輪廓，merge_tiny_colors 已處理可繪性
+                if area >= 1 and len(c) >= 3:
                     all_contours.append((area, idx, color, c))
 
         all_contours.sort(key=lambda x: x[0], reverse=True)
@@ -1341,19 +1350,29 @@ class PbnGen:
             }
         palette = list(palette_map.values())
 
-        # 背景白底（保證無空隙透出）
+        # 背景白底
         dwg.add(dwg.rect((0, 0), (w, h), fill="white"))
 
-        # Pass 1：全部填色（無 stroke）→ 面積大先畫，確保完整覆蓋
+        # Pass 1：SVG polygon 填色 + 自己的 stroke（DP 平滑輪廓）
+        dp_epsilon = 1.0  # 平滑程度，越大越簡化
         for area, idx, color, c in all_contours:
-            color_fill = "rgb({},{},{})".format(int(color[0]), int(color[1]), int(color[2]))
-            points = c.squeeze().tolist()
-            if len(c.squeeze().shape) == 1:
-                points = [points]
-            dwg.add(dwg.polygon(points, fill="white", stroke="none"))
-            dwg.add(dwg.polygon(points, fill=color_fill, stroke="none", fill_opacity="0.25"))
+            approx = cv2.approxPolyDP(c, dp_epsilon, closed=True)
+            pts = approx.squeeze()
+            if pts.ndim == 1:
+                pts = pts.reshape(1, 2)
+            points_list = [(int(x), int(y)) for x, y in pts]
+            r = int(color[0] * 0.25 + 255 * 0.75)
+            g = int(color[1] * 0.25 + 255 * 0.75)
+            b = int(color[2] * 0.25 + 255 * 0.75)
+            hex_color = f"#{r:02X}{g:02X}{b:02X}"
+            dwg.add(dwg.polygon(
+                points=points_list,
+                fill=hex_color,
+                stroke="#AAAAAA",
+                stroke_width=str(stroke_svg),
+            ))
 
-        # Pass 2：數字標籤（線條由 Pass 3 的邊界路徑統一繪製）
+        # Pass 2：數字標籤
         placed_labels = []
         for area, idx, color, c in all_contours:
             group = dwg.g(id=str(i))
@@ -1369,11 +1388,7 @@ class PbnGen:
             palette[idx]["shapes"].append(str(i))
             i += 1
 
-        # Pass 3：邊界路徑（每條邊只畫一次，DP 平滑，mm 物理單位）
-        bnd_d = self._boundary_svg_path(snapped_rgb)
-        dwg.add(dwg.path(d=bnd_d, fill="none", stroke="black",
-                         stroke_width=f"{stroke_mm:.3f}mm",
-                         stroke_linecap="round", stroke_linejoin="round"))
+        # Pass 3：邊界線由各 polygon 自己的 stroke 負責，不再另外畫
 
         dwg.save()
         print(f"{i} shapes")

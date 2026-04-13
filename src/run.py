@@ -282,8 +282,8 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
     img_h, img_w = pbn.getImage().shape[:2]
     multiplier     = level.get("min_ratio_multiplier", 1.0)
     min_radius_px  = calc_min_radius_px(canvas_cm[0], img_w) * multiplier
-    merge_mask     = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
     print(f"  畫布 {canvas_cm[0]}×{canvas_cm[1]} cm × {multiplier}× → min_radius={min_radius_px:.1f}px")
+    merge_mask = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
     pbn.merge_tiny_colors(min_radius_px=min_radius_px, exclude_mask=merge_mask)
 
     svg_path    = os.path.join(level_dir, "template.svg")
