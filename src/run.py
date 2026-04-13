@@ -22,6 +22,8 @@ from pbn_gen import PbnGen
 NAME         = "Mom"
 STYLE_TAGS   = ["人物","自拍","卡通"]
 MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
+DETAIL       = "標準"          # "粗糙" / "標準" / "細緻" / "高級"
+COMPARE_DETAILS = True         # True = 跑所有細緻度（僅入門），False = 只跑 DETAIL
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色
@@ -168,56 +170,56 @@ def pricing_suggestion(sam_mask, mode, extra_colors, canvas_cm):
     return lines
 
 
-DIFFICULTY_LEVELS = [
-    {
-        "name": "入門",
-        "num_colors": 18,
-        "pruning_threshold": 8e-4,
+# 細緻度選項：根據年齡層 / 使用者喜好選擇，所有難易度共用同一套
+# blur 越小、min_ratio 越低 → 格子越多越細緻（適合成人、小尺寸）
+# blur 越大、min_ratio 越高 → 格子越少越粗（適合幼兒、大尺寸）
+DETAIL_PRESETS = {
+    "粗糙": {
         "blur_ksize": 31,
         "blur_sigma_color": 51,
         "blur_sigma_space": 51,
         "prune_iterations": 10,
-        "bg_extra_blur": 21,        # weighted 模式：非選取區額外模糊
-        "refine_extra_colors": 8,   # sam_refine：遮罩區額外色數
-        "min_ratio_multiplier": 2.0, # 小色塊合併門檻倍數（越大合併越多）
+        "bg_extra_blur": 21,
+        "min_ratio_multiplier": 2.0,
     },
-    {
-        "name": "初級",
-        "num_colors": 24,
-        "pruning_threshold": 2e-4,
-        "blur_ksize": 25,
-        "blur_sigma_color": 35,
-        "blur_sigma_space": 35,
-        "prune_iterations": 8,
-        "bg_extra_blur": 15,
-        "refine_extra_colors": 12,
-        "min_ratio_multiplier": 1.5,
-    },
-    {
-        "name": "中級",
-        "num_colors": 35,
-        "pruning_threshold": 6.25e-5,
+    "標準": {
         "blur_ksize": 21,
         "blur_sigma_color": 21,
         "blur_sigma_space": 14,
         "prune_iterations": 6,
-        "bg_extra_blur": 9,
-        "refine_extra_colors": 18,
+        "bg_extra_blur": 21,
         "min_ratio_multiplier": 1.0,
     },
-    {
-        "name": "進階",
-        "num_colors": 50,
-        "pruning_threshold": 1.5e-5,
+    "細緻": {
         "blur_ksize": 13,
         "blur_sigma_color": 13,
         "blur_sigma_space": 9,
         "prune_iterations": 3,
-        "bg_extra_blur": 0,         # 進階：非選取區不額外加模糊
-        "refine_extra_colors": 25,
+        "bg_extra_blur": 9,
         "min_ratio_multiplier": 0.6,
     },
+    "高級": {
+        "blur_ksize": 7,
+        "blur_sigma_color": 7,
+        "blur_sigma_space": 5,
+        "prune_iterations": 1,
+        "bg_extra_blur": 0,
+        "min_ratio_multiplier": 0.3,
+    },
+}
+
+# 難易度：只調顏色數量與相關門檻，細緻度由 DETAIL_PRESETS[DETAIL] 統一控制
+DIFFICULTY_LEVELS = [
+    {"name": "入門", "num_colors": 18, "pruning_threshold": 8e-4,    "refine_extra_colors": 8},
+    {"name": "初級", "num_colors": 24, "pruning_threshold": 2e-4,    "refine_extra_colors": 12},
+    {"name": "中級", "num_colors": 35, "pruning_threshold": 6.25e-5, "refine_extra_colors": 18},
+    {"name": "進階", "num_colors": 50, "pruning_threshold": 1.5e-5,  "refine_extra_colors": 25},
 ]
+
+# 合併選定的細緻度到每個難度
+_detail = DETAIL_PRESETS.get(DETAIL, DETAIL_PRESETS["標準"])
+for _lv in DIFFICULTY_LEVELS:
+    _lv.update({k: v for k, v in _detail.items() if k not in _lv})
 
 
 def load_sam_mask(name):
@@ -443,14 +445,28 @@ def main():
         mode_dir = os.path.join(OUTPUT_BASE, NAME, MODE, canvas_str)
         os.makedirs(mode_dir, exist_ok=True)
 
-        for level in DIFFICULTY_LEVELS:
-            level_dir = os.path.join(mode_dir, level["name"])
-            os.makedirs(level_dir, exist_ok=True)
-            summary = run_single_level(
-                input_image_path, level_dir, level, MODE, sam_mask,
-                canvas_cm=canvas_cm, pricing_info=pricing_info
-            )
-            all_summaries.append(summary)
+        if COMPARE_DETAILS:
+            # 比較模式：固定入門難度，跑所有細緻度
+            base_level = next(lv for lv in DIFFICULTY_LEVELS if lv["name"] == "入門")
+            for detail_name, detail_params in DETAIL_PRESETS.items():
+                compare_level = {**base_level, **detail_params}
+                level_dir = os.path.join(mode_dir, f"入門_{detail_name}")
+                os.makedirs(level_dir, exist_ok=True)
+                print(f"\n[比較] 細緻度：{detail_name}")
+                summary = run_single_level(
+                    input_image_path, level_dir, compare_level, MODE, sam_mask,
+                    canvas_cm=canvas_cm, pricing_info=pricing_info
+                )
+                all_summaries.append(summary)
+        else:
+            for level in DIFFICULTY_LEVELS:
+                level_dir = os.path.join(mode_dir, level["name"])
+                os.makedirs(level_dir, exist_ok=True)
+                summary = run_single_level(
+                    input_image_path, level_dir, level, MODE, sam_mask,
+                    canvas_cm=canvas_cm, pricing_info=pricing_info
+                )
+                all_summaries.append(summary)
 
     update_color_stats(all_summaries)
     print(f"\n[OK] 完成，結果在：{os.path.join(OUTPUT_BASE, NAME, MODE)}")
