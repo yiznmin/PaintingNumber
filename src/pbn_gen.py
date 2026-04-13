@@ -1306,18 +1306,29 @@ class PbnGen:
         # snapped_rgb 用於 smoothed_masks 的遮罩計算（輪廓邊界對齊）
         # filled.png 來源改為光柵化 template 輪廓後設定（見下方 template_rgb）
 
-        # contours 只用於標籤定位，不用於填色
-        all_contours = []
+        # contours：原始（用於標籤定位）+ 膨脹版（用於填色，消除縫隙）
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        all_contours = []        # (area, idx, color, orig_c, dilated_c)
         for idx, (color, mask) in enumerate(color_masks.items()):
             smooth_mask = smoothed_masks.get(color, mask)
             mask_uint8 = np.all(smooth_mask, axis=2).astype(np.uint8) * 255
+            # 原始輪廓（標籤定位用）
             contours, _ = cv2.findContours(
                 mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            for c in contours:
+            # 膨脹 1px 輪廓（填色用，相鄰色塊重疊 → 無縫隙）
+            dilated = cv2.dilate(mask_uint8, dilate_kernel, iterations=1)
+            dilated_contours, _ = cv2.findContours(
+                dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            # 配對：原始和膨脹輪廓依面積排序後對應
+            orig_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
+            dil_sorted  = sorted(dilated_contours, key=cv2.contourArea, reverse=True)
+            for k, c in enumerate(orig_sorted):
                 area = cv2.contourArea(c)
                 if area >= 1 and len(c) >= 3:
-                    all_contours.append((area, idx, color, c))
+                    dc = dil_sorted[k] if k < len(dil_sorted) else c
+                    all_contours.append((area, idx, color, c, dc))
 
         all_contours.sort(key=lambda x: x[0], reverse=True)
 
@@ -1325,7 +1336,7 @@ class PbnGen:
 
         # 建立這幅畫的 1~N 專屬編號（面積最大的顏色得 #1）
         color_to_seq = {}
-        for _, idx, color, _ in all_contours:
+        for _, idx, color, c, dc in all_contours:
             key = tuple(int(v) for v in color)
             if key not in color_to_seq:
                 color_to_seq[key] = len(color_to_seq) + 1
@@ -1353,10 +1364,9 @@ class PbnGen:
         # 背景白底
         dwg.add(dwg.rect((0, 0), (w, h), fill="white"))
 
-        # Pass 1：SVG polygon 填色 + 自己的 stroke（DP 平滑輪廓）
-        dp_epsilon = 1.0  # 平滑程度，越大越簡化
-        for area, idx, color, c in all_contours:
-            approx = cv2.approxPolyDP(c, dp_epsilon, closed=True)
+        # Pass 1：填色 + 描邊（同一個膨脹輪廓，完全對齊，相鄰重疊消除縫隙）
+        for area, idx, color, c, dc in all_contours:
+            approx = cv2.approxPolyDP(dc, 1.0, closed=True)
             pts = approx.squeeze()
             if pts.ndim == 1:
                 pts = pts.reshape(1, 2)
@@ -1370,11 +1380,12 @@ class PbnGen:
                 fill=hex_color,
                 stroke="#AAAAAA",
                 stroke_width=str(stroke_svg),
+                **{"stroke-linecap": "round", "stroke-linejoin": "round"}
             ))
 
-        # Pass 2：數字標籤
+        # Pass 2：數字標籤（用原始輪廓定位）
         placed_labels = []
-        for area, idx, color, c in all_contours:
+        for area, idx, color, c, dc in all_contours:
             group = dwg.g(id=str(i))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
@@ -1387,8 +1398,6 @@ class PbnGen:
             dwg.add(group)
             palette[idx]["shapes"].append(str(i))
             i += 1
-
-        # Pass 3：邊界線由各 polygon 自己的 stroke 負責，不再另外畫
 
         dwg.save()
         print(f"{i} shapes")
@@ -1433,7 +1442,7 @@ class PbnGen:
         smoothed_masks = self._template_smoothed
 
         # Pass 1：25% 提示色填充
-        for area, idx, color, c in all_contours:
+        for area, idx, color, c, dc in all_contours:
             pts = c.squeeze().tolist()
             if not isinstance(pts[0], (list, tuple)):
                 pts = [pts]
@@ -1444,7 +1453,7 @@ class PbnGen:
 
         # Pass 2：輪廓線
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        for area, idx, color, c in all_contours:
+        for area, idx, color, c, dc in all_contours:
             cv2.drawContours(img_cv, [c], -1, (0, 0, 0), thickness=line_w,
                              lineType=cv2.LINE_AA)
 
@@ -1458,7 +1467,7 @@ class PbnGen:
             font = ImageFont.load_default()
 
         placed = []
-        for area, idx, color, c in all_contours:
+        for area, idx, color, c, dc in all_contours:
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
             sm = smoothed_masks.get(key)
