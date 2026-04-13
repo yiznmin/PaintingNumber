@@ -1184,14 +1184,21 @@ class PbnGen:
         return snapped, smoothed_masks
 
     @staticmethod
-    def _merge_small_regions(snapped_rgb: np.ndarray, min_area_px: int) -> np.ndarray:
+    def _merge_small_regions(snapped_rgb: np.ndarray, min_width_px: float) -> np.ndarray:
         """
-        消除小碎片：面積 < min_area_px 的連通區域，用周圍出現最多的顏色填充。
-        反覆執行直到沒有小碎片為止。
+        消除小碎片：同時滿足以下兩個條件才合併：
+          1. 面積 < (min_width_px * 2)^2（約一個 0.4cm×0.4cm 的正方形）
+          2. distanceTransform 最大值 * 2 < min_width_px（最大可畫寬度 < 0.2cm）
+        反覆執行直到沒有符合條件的碎片為止。
         """
         h, w = snapped_rgb.shape[:2]
         palette = np.unique(snapped_rgb.reshape(-1, 3), axis=0)  # (N, 3) uint8
         n_colors = len(palette)
+
+        # 面積門檻：(0.2cm × 2)^2 的正方形像素數
+        area_threshold = int((min_width_px * 2) ** 2)
+        # 寬度門檻：inscribed circle 半徑 < 0.1cm（直徑 < 0.2cm）
+        radius_threshold = min_width_px / 2.0
 
         # 建立顏色索引圖（每個像素 → palette index）
         label_img = np.zeros((h, w), dtype=np.int32)
@@ -1210,9 +1217,15 @@ class PbnGen:
                 for comp_id in range(1, n_comp):
                     comp_mask = (comp_map == comp_id)
                     area = int(comp_mask.sum())
-                    if area >= min_area_px:
+                    # 條件 1：面積要夠小才考慮
+                    if area >= area_threshold:
                         continue
-                    # 找邊界相鄰像素的顏色
+                    # 條件 2：最大寬度 < 0.2cm（distanceTransform 最大值 < radius_threshold）
+                    dist = cv2.distanceTransform(comp_mask.astype(np.uint8), cv2.DIST_L2, 5)
+                    max_radius = float(dist.max())
+                    if max_radius >= radius_threshold:
+                        continue
+                    # 找邊界相鄰像素的顏色，合併到最多的鄰居
                     dilated = cv2.dilate(comp_mask.astype(np.uint8), dilate_kernel) > 0
                     border = dilated & ~comp_mask
                     neighbor_labels = label_img[border]
@@ -1347,10 +1360,9 @@ class PbnGen:
         snapped_rgb, smoothed_masks = self._smooth_quantized(
             self.getImage(), color_masks, blur_ksize=5
         )
-        # 消除小碎片：面積 < min_area_px 的連通區域，合併到鄰近顏色
-        # min_area_px 根據 min_font_px 估算：字至少需要 (font*1.5)^2 的面積
-        min_area_px = max(50, int((min_font_px * 1.5) ** 2))
-        snapped_rgb = self._merge_small_regions(snapped_rgb, min_area_px)
+        # 消除小碎片：寬度 < 0.2cm 且面積夠小的連通區域，合併到鄰近顏色
+        # min_font_px 即 0.2cm 對應的像素數，作為寬度門檻
+        snapped_rgb = self._merge_small_regions(snapped_rgb, min_font_px)
         # 重新建立 smoothed_masks（與合併後的 snapped_rgb 對齊）
         smoothed_masks = {}
         for color_key in color_masks.keys():
