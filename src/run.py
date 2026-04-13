@@ -23,7 +23,8 @@ NAME         = "Mom"
 STYLE_TAGS   = ["人物","自拍","卡通"]
 MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
 DETAIL       = "標準"          # "粗糙" / "標準" / "細緻" / "高級"
-COMPARE_DETAILS = True         # True = 跑所有細緻度（僅入門），False = 只跑 DETAIL
+COMPARE_DETAILS = True         # True = 跑所有細緻度，False = 只跑 DETAIL
+COMPARE_DIFFICULTY = None    # 比較模式下跑哪個難度，None = 跑所有難度
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色
@@ -446,18 +447,23 @@ def main():
         os.makedirs(mode_dir, exist_ok=True)
 
         if COMPARE_DETAILS:
-            # 比較模式：固定入門難度，跑所有細緻度
-            base_level = next(lv for lv in DIFFICULTY_LEVELS if lv["name"] == "入門")
-            for detail_name, detail_params in DETAIL_PRESETS.items():
-                compare_level = {**base_level, **detail_params}
-                level_dir = os.path.join(mode_dir, f"入門_{detail_name}")
-                os.makedirs(level_dir, exist_ok=True)
-                print(f"\n[比較] 細緻度：{detail_name}")
-                summary = run_single_level(
-                    input_image_path, level_dir, compare_level, MODE, sam_mask,
-                    canvas_cm=canvas_cm, pricing_info=pricing_info
-                )
-                all_summaries.append(summary)
+            # 比較模式：跑所有細緻度
+            # COMPARE_DIFFICULTY = 指定難度名稱 → 只跑該難度；None → 跑所有難度
+            if COMPARE_DIFFICULTY is not None:
+                compare_levels = [lv for lv in DIFFICULTY_LEVELS if lv["name"] == COMPARE_DIFFICULTY]
+            else:
+                compare_levels = DIFFICULTY_LEVELS
+            for base_level in compare_levels:
+                for detail_name, detail_params in DETAIL_PRESETS.items():
+                    compare_level = {**base_level, **detail_params}
+                    level_dir = os.path.join(mode_dir, f"{base_level['name']}_{detail_name}")
+                    os.makedirs(level_dir, exist_ok=True)
+                    print(f"\n[比較] {base_level['name']} × {detail_name}")
+                    summary = run_single_level(
+                        input_image_path, level_dir, compare_level, MODE, sam_mask,
+                        canvas_cm=canvas_cm, pricing_info=pricing_info
+                    )
+                    all_summaries.append(summary)
         else:
             for level in DIFFICULTY_LEVELS:
                 level_dir = os.path.join(mode_dir, level["name"])
