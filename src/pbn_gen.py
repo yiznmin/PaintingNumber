@@ -1184,6 +1184,50 @@ class PbnGen:
         return snapped, smoothed_masks
 
     @staticmethod
+    def _merge_small_regions(snapped_rgb: np.ndarray, min_area_px: int) -> np.ndarray:
+        """
+        消除小碎片：面積 < min_area_px 的連通區域，用周圍出現最多的顏色填充。
+        反覆執行直到沒有小碎片為止。
+        """
+        h, w = snapped_rgb.shape[:2]
+        palette = np.unique(snapped_rgb.reshape(-1, 3), axis=0)  # (N, 3) uint8
+        n_colors = len(palette)
+
+        # 建立顏色索引圖（每個像素 → palette index）
+        label_img = np.zeros((h, w), dtype=np.int32)
+        for ci, c in enumerate(palette):
+            label_img[np.all(snapped_rgb == c, axis=2)] = ci
+
+        dilate_kernel = np.ones((3, 3), dtype=np.uint8)
+        changed = True
+        while changed:
+            changed = False
+            for ci in range(n_colors):
+                single_mask = (label_img == ci).astype(np.uint8)
+                if single_mask.sum() == 0:
+                    continue
+                n_comp, comp_map = cv2.connectedComponents(single_mask, connectivity=4)
+                for comp_id in range(1, n_comp):
+                    comp_mask = (comp_map == comp_id)
+                    area = int(comp_mask.sum())
+                    if area >= min_area_px:
+                        continue
+                    # 找邊界相鄰像素的顏色
+                    dilated = cv2.dilate(comp_mask.astype(np.uint8), dilate_kernel) > 0
+                    border = dilated & ~comp_mask
+                    neighbor_labels = label_img[border]
+                    if len(neighbor_labels) == 0:
+                        continue
+                    counts = np.bincount(neighbor_labels, minlength=n_colors).astype(np.int64)
+                    counts[ci] = 0  # 排除自己
+                    best_ci = int(np.argmax(counts))
+                    label_img[comp_mask] = best_ci
+                    changed = True
+
+        # 重建 RGB 圖
+        result = palette[label_img].astype(np.uint8)
+        return result
+
     @staticmethod
     def _boundary_svg_path(snapped_rgb: np.ndarray, dp_epsilon: float = 0.7) -> str:
         """
@@ -1303,8 +1347,17 @@ class PbnGen:
         snapped_rgb, smoothed_masks = self._smooth_quantized(
             self.getImage(), color_masks, blur_ksize=5
         )
-        # snapped_rgb 用於 smoothed_masks 的遮罩計算（輪廓邊界對齊）
-        # filled.png 來源改為光柵化 template 輪廓後設定（見下方 template_rgb）
+        # 消除小碎片：面積 < min_area_px 的連通區域，合併到鄰近顏色
+        # min_area_px 根據 min_font_px 估算：字至少需要 (font*1.5)^2 的面積
+        min_area_px = max(50, int((min_font_px * 1.5) ** 2))
+        snapped_rgb = self._merge_small_regions(snapped_rgb, min_area_px)
+        # 重新建立 smoothed_masks（與合併後的 snapped_rgb 對齊）
+        smoothed_masks = {}
+        for color_key in color_masks.keys():
+            color_arr = np.array(list(color_key), dtype=np.uint8)
+            mask_bool = np.all(snapped_rgb == color_arr, axis=2)
+            if mask_bool.any():
+                smoothed_masks[color_key] = np.stack([mask_bool] * 3, axis=2)
 
         # contours：原始（用於標籤定位）+ 膨脹版（用於填色，消除縫隙）
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -1383,14 +1436,23 @@ class PbnGen:
                 **{"stroke-linecap": "round", "stroke-linejoin": "round"}
             ))
 
-        # Pass 2：數字標籤（用原始輪廓定位）
+        # 預先建立視覺 region map（考慮 SVG 繪製順序：大先畫，小後畫蓋上）
+        # 每個像素記錄視覺上屬於哪個 contour index
+        region_map = np.full((h, w), -1, dtype=np.int32)
+        for k, (area, idx, color, c, dc) in enumerate(all_contours):
+            approx = cv2.approxPolyDP(dc, 1.0, closed=True)
+            cv2.fillPoly(region_map, [approx], k)
+
+        # Pass 2：數字標籤（用 region_map 確保標籤只放在自己的視覺區域）
         placed_labels = []
-        for area, idx, color, c, dc in all_contours:
+        for k, (area, idx, color, c, dc) in enumerate(all_contours):
             group = dwg.g(id=str(i))
             key = tuple(int(v) for v in color)
             label = str(color_to_seq.get(key, idx + 1))
-            color_mask = smoothed_masks.get(color)
-            text = self.add_text_label(dwg, c, label, color_mask=color_mask,
+            # 視覺遮罩：只有 region_map == k 的像素才是這個 region 的可放區域
+            visual_mask_2d = (region_map == k).astype(np.uint8) * 255
+            visual_mask_3ch = np.stack([visual_mask_2d] * 3, axis=2)
+            text = self.add_text_label(dwg, c, label, color_mask=visual_mask_3ch,
                                        placed_labels=placed_labels,
                                        min_font_px=min_font_px)
             if text is not None:
@@ -1480,13 +1542,16 @@ class PbnGen:
                 f = ImageFont.truetype("arial.ttf", font_pt)
             except Exception:
                 f = font
-            pos = self._label_position_from_mask(c, sm, placed_labels=placed,
-                                                 font_size=text_px)
+            pos, dist_b = self._label_position_from_mask(c, sm, placed_labels=placed,
+                                                          font_size=text_px)
             if pos is None:
                 m = cv2.moments(c)
                 if m["m00"] != 0:
                     pos = (m["m10"] / m["m00"], m["m01"] / m["m00"])
             if pos:
+                if dist_b > 0:
+                    text_px = min(text_px, dist_b * 1.8)
+                    text_px = max(text_px, self._template_min_font)
                 draw.text((pos[0], pos[1]), label, fill=(0, 0, 0), font=f, anchor="mm")
                 placed.append((pos[0], pos[1], text_px))
 
@@ -1567,32 +1632,32 @@ class PbnGen:
         若最佳點與已有標籤衝突，往下找次優峰值（最多嘗試 5 次）。
         全部衝突時回傳 None（跳過這個標籤）。
         """
-        color_mask = color_mask_3ch[:, :, 0]
         x, y, bw, bh = cv2.boundingRect(contour)
         if bw == 0 or bh == 0:
-            return None
+            return None, 0.0
 
-        # 輪廓填充遮罩（bounding rect 內）
+        # 直接從輪廓建填充 mask（不依賴外部 color_mask，確保與填色 polygon 一致）
         roi_contour = np.zeros((bh, bw), dtype=np.uint8)
         shifted = contour - np.array([[[x, y]]])
         cv2.drawContours(roi_contour, [shifted], -1, 255, cv2.FILLED)
+        valid_mask = roi_contour
 
-        # 只取輪廓內且屬於此顏色的像素
-        roi_color = color_mask[y:y+bh, x:x+bw].astype(np.uint8)
-        valid_mask = ((roi_contour > 0) & (roi_color > 0)).astype(np.uint8) * 255
-
-        if valid_mask.sum() == 0:
-            m = cv2.moments(contour)
-            if m["m00"] != 0:
-                return (m["m10"] / m["m00"], m["m01"] / m["m00"])
-            return None
+        # 若有提供 color_mask 則取交集（更精確）
+        if color_mask_3ch is not None:
+            color_mask = color_mask_3ch[:, :, 0]
+            roi_color = color_mask[y:y+bh, x:x+bw].astype(np.uint8)
+            intersection = ((roi_contour > 0) & (roi_color > 0)).astype(np.uint8) * 255
+            if intersection.sum() > 0:
+                valid_mask = intersection
 
         # distanceTransform：每個有效像素到最近邊界的距離
         dist = cv2.distanceTransform(valid_mask, cv2.DIST_L2, 5)
         dist_work = dist.copy()
 
         best_pos = None      # 最佳不衝突位置
+        best_dist = 0.0      # 該位置到邊界的距離
         fallback_pos = None  # 萬不得已的備用位置（最大 dist 但衝突最輕）
+        fallback_dist = 0.0
         fallback_overlap = float('inf')
 
         for _ in range(15):  # 多試幾個候選點
@@ -1615,12 +1680,14 @@ class PbnGen:
 
             if max_overlap == 0:
                 best_pos = (cx, cy)
+                best_dist = float(max_val)
                 break  # 找到不衝突的位置
 
             # 記錄衝突最小的備用位置
             if max_overlap < fallback_overlap:
                 fallback_overlap = max_overlap
                 fallback_pos = (cx, cy)
+                fallback_dist = float(max_val)
 
             # 抑制這個峰值附近區域
             r = max(1, int(font_size * 0.5))
@@ -1629,7 +1696,11 @@ class PbnGen:
             dist_work[r0:r1, c0:c1] = 0
 
         # 有不衝突位置就用，否則用衝突最小的備用位置
-        return best_pos if best_pos is not None else fallback_pos
+        if best_pos is not None:
+            return best_pos, best_dist
+        elif fallback_pos is not None:
+            return fallback_pos, fallback_dist
+        return None, 0.0
 
     def add_text_label(self, dwg, contour, label, color_mask=None, placed_labels=None,
                        min_font_px: float = 3.0):
@@ -1637,17 +1708,21 @@ class PbnGen:
         if area < 1:
             return None
 
-        # 字體大小依面積決定，下限由 min_font_px（換算自 0.2cm）決定，上限 12px
-        max_font_px = max(min_font_px * 4, 12)
-        text_size = float(np.clip(area ** 0.5 / 8, min_font_px, max_font_px))
+        # 字體由面積決定，範圍 0.2cm～0.4cm（min_font_px～min_font_px*2）
+        text_size = float(np.clip(area ** 0.5 / 10, min_font_px, min_font_px * 2))
 
-        pos = None
-        if color_mask is not None:
-            pos = self._label_position_from_mask(
-                contour, color_mask,
-                placed_labels=placed_labels,
-                font_size=text_size
-            )
+        pos, dist_to_boundary = self._label_position_from_mask(
+            contour, color_mask,
+            placed_labels=placed_labels,
+            font_size=text_size
+        )
+        # 確保文字不超出格子邊界
+        if dist_to_boundary > 0:
+            num_digits = len(label)
+            size_by_width  = dist_to_boundary * 2.0 / (0.6 * num_digits)
+            size_by_height = dist_to_boundary * 2.0
+            text_size = float(np.clip(min(text_size, size_by_width, size_by_height),
+                                      min_font_px, min_font_px * 2))
 
         # fallback：輪廓重心（極少觸發，僅當遮罩完全無效時）
         if pos is None:
@@ -1678,7 +1753,8 @@ class PbnGen:
 
         return dwg.text(
             label,
-            insert=pos,
+            insert=(pos[0], pos[1]),
             font_size=str(text_size),
             text_anchor="middle",
+            **{"dominant-baseline": "central"}
         )
