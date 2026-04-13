@@ -295,6 +295,7 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
                                      canvas_w_cm=canvas_cm[0],
                                      canvas_h_cm=canvas_cm[1])
     pbn.output_filled_image(filled_path)
+    pbn.output_filled_from_template(os.path.join(level_dir, "filled_template.png"))
 
     # ── 顏色佔比分析 ─────────────────────────────────────────────────
     filled_img = cv2.imdecode(

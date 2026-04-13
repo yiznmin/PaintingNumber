@@ -1499,6 +1499,34 @@ class PbnGen:
         else:
             print(f"[ERR] template.png 編碼失敗: {output_path}")
 
+    def output_filled_from_template(self, output_path: str):
+        """
+        用 template 的 polygon 輪廓（膨脹版）填上完整原色，
+        呈現「按模板上色完成」的效果圖。
+        必須在 output_to_svg 之後呼叫。
+        """
+        if not hasattr(self, '_template_contours'):
+            print("[!] 請先呼叫 output_to_svg")
+            return
+        h, w = self.getImage().shape[:2]
+        canvas = np.ones((h, w, 3), dtype=np.uint8) * 255  # 白底
+
+        all_contours = self._template_contours
+        # 由大到小畫（小的後畫蓋在上面），確保小區塊不被大區塊蓋掉
+        for area, idx, color, c, dc in sorted(all_contours, key=lambda x: x[0], reverse=True):
+            approx = cv2.approxPolyDP(dc, 1.0, closed=True)
+            r, g, b = int(color[0]), int(color[1]), int(color[2])
+            cv2.fillPoly(canvas, [approx], color=(r, g, b))
+
+        canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+        success, buf = cv2.imencode(".png", canvas_bgr)
+        if success:
+            with open(output_path, "wb") as f:
+                f.write(buf.tobytes())
+            print(f"Template filled 效果圖已儲存: {output_path}")
+        else:
+            print(f"[ERR] 編碼失敗: {output_path}")
+
     def output_filled_image(self, output_path: str, border: bool = False):
         """
         輸出填色完成效果圖。
