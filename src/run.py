@@ -21,7 +21,7 @@ from pbn_gen import PbnGen
 # ── 設定區（只需改這裡）────────────────────────────────
 NAME         = "Mom"
 STYLE_TAGS   = ["人物","自拍","卡通"]
-MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
+MODE         = "sam_weighted"   # "standard" / "sam_refine" / "sam_weighted"
 DETAIL       = "標準"          # "粗糙" / "標準" / "細緻" / "高級"
 COMPARE_DETAILS = True         # True = 跑所有細緻度，False = 只跑 DETAIL
 COMPARE_DIFFICULTY = None    # 比較模式下跑哪個難度，None = 跑所有難度
@@ -289,22 +289,20 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
     merge_mask = sam_mask_cropped if (mode == "sam_refine" and sam_mask_cropped is not None) else None
     pbn.merge_tiny_colors(min_radius_px=min_radius_px, exclude_mask=merge_mask)
 
-    svg_path    = os.path.join(level_dir, "template.svg")
-    filled_path = os.path.join(level_dir, "filled.png")
-    json_path   = os.path.join(level_dir, "palette.json")
+    svg_path  = os.path.join(level_dir, "template.svg")
+    json_path = os.path.join(level_dir, "palette.json")
 
     palette_data = pbn.output_to_svg(svg_path, json_path,
                                      min_radius_px=min_radius_px,
                                      canvas_w_cm=canvas_cm[0],
                                      canvas_h_cm=canvas_cm[1])
-    pbn.output_filled_image(filled_path)
     pbn.output_filled_from_template(os.path.join(level_dir, "filled_template.png"))
 
-    # ── 顏色佔比分析 ─────────────────────────────────────────────────
-    filled_img = cv2.imdecode(
-        np.fromfile(filled_path, dtype=np.uint8), cv2.IMREAD_COLOR
-    )
-    filled_rgb = cv2.cvtColor(filled_img, cv2.COLOR_BGR2RGB)
+    # ── 顏色佔比分析（直接從記憶體 snapped_rgb 計算，不需要存 filled.png）─────
+    filled_rgb = getattr(pbn, '_snapped_rgb', pbn.getImage().copy())
+    if filled_rgb.shape[2] == 3:
+        filled_rgb = cv2.cvtColor(filled_rgb, cv2.COLOR_BGR2RGB) \
+                     if filled_rgb.dtype == np.uint8 else filled_rgb
     img_h, img_w = filled_rgb.shape[:2]
     total_px = img_h * img_w
     pixels_flat = filled_rgb.reshape(-1, 3)
