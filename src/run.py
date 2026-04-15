@@ -21,10 +21,10 @@ from pbn_gen import PbnGen
 # ── 設定區（只需改這裡）────────────────────────────────
 NAME         = "Mom"
 STYLE_TAGS   = ["人物","自拍","卡通"]
-MODE         = "sam_weighted"   # "standard" / "sam_refine" / "sam_weighted"
-DETAIL       = "標準"          # "粗糙" / "標準" / "細緻" / "高級"
-COMPARE_DETAILS = True         # True = 跑所有細緻度，False = 只跑 DETAIL
-COMPARE_DIFFICULTY = None    # 比較模式下跑哪個難度，None = 跑所有難度
+MODE         = "sam_refine"   # "standard" / "sam_refine" / "sam_weighted"
+DETAIL       = "細緻"          # "粗糙" / "標準" / "細緻" / "高級"
+COMPARE_DETAILS =   False      # True = 跑所有細緻度，False = 只跑 DETAIL
+COMPARE_DIFFICULTY = "中級"   # 比較模式下跑哪個難度，None = 跑所有難度
 
 # sam_refine 參數
 EXTRA_COLORS  = 10   # 選取區額外增加幾色

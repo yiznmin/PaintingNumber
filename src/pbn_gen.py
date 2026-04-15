@@ -1350,11 +1350,8 @@ class PbnGen:
             stroke_svg = 0.5
             min_font_px = 3.0
             svg_size = (str(w), str(h))
-        # viewBox 加 padding，避免邊緣數字被裁切
-        pad = int(min_font_px * 1.5)
         dwg = svgwrite.Drawing(svg_path, profile="full",
-                               size=svg_size,
-                               viewBox=(f"{-pad} {-pad} {w + pad*2} {h + pad*2}"))
+                               size=svg_size, viewBox=(f"0 0 {w} {h}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
 
@@ -1761,6 +1758,13 @@ class PbnGen:
                     if overlap < best_overlap:
                         best_overlap = overlap
                         pos = (tx, ty)
+
+        # 限制標籤不超出圖片邊界（保留半個字體大小的安全邊距）
+        h_img, w_img = self.getImage().shape[:2]
+        margin = text_size / 2.0
+        px = float(np.clip(pos[0], margin, w_img - margin))
+        py = float(np.clip(pos[1], margin, h_img - margin))
+        pos = (px, py)
 
         # 記錄已放置位置
         if placed_labels is not None:
