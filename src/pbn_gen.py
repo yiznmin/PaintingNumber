@@ -1350,8 +1350,11 @@ class PbnGen:
             stroke_svg = 0.5
             min_font_px = 3.0
             svg_size = (str(w), str(h))
+        # viewBox 加 padding，避免邊緣數字被裁切
+        pad = int(min_font_px * 1.5)
         dwg = svgwrite.Drawing(svg_path, profile="full",
-                               size=svg_size, viewBox=(f"0 0 {w} {h}"))
+                               size=svg_size,
+                               viewBox=(f"{-pad} {-pad} {w + pad*2} {h + pad*2}"))
         i = 0
         color_masks = self.getUniqueColorsMasks()
 
