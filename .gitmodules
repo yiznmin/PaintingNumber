@@ -1,0 +1,3 @@
+[submodule "paint-by-number"]
+	path = paint-by-number
+	url = https://github.com/yiznmin/PaintingNumber.git

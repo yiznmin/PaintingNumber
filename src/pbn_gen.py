@@ -1430,7 +1430,8 @@ class PbnGen:
         dwg.add(dwg.rect((0, 0), (w, h), fill="white"))
 
         # Pass 1：填色 + 描邊（同一個膨脹輪廓，完全對齊，相鄰重疊消除縫隙）
-        for area, idx, color, c, dc in all_contours:
+        # id=rN：region 編號（依 all_contours 面積遞減順序），給 admin 後處理用 polygon_id 識別
+        for k, (area, idx, color, c, dc) in enumerate(all_contours):
             approx = cv2.approxPolyDP(dc, 1.0, closed=True)
             pts = approx.squeeze()
             if pts.ndim == 1:
@@ -1445,6 +1446,7 @@ class PbnGen:
                 fill=hex_color,
                 stroke="#AAAAAA",
                 stroke_width=str(stroke_svg),
+                id=f"r{k}",
                 **{"stroke-linecap": "round", "stroke-linejoin": "round"}
             ))
 
