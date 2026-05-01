@@ -16,7 +16,7 @@ import sys
 import os
 import subprocess
 
-INKSCAPE = r"D:\Inkscape\bin\inkscape.exe"
+INKSCAPE = os.environ.get("INKSCAPE_PATH", r"D:\Inkscape\bin\inkscape.exe")
 OUTPUT_BASE = r"D:\website\PaintLearn\paint-by-number\output"
 
 
