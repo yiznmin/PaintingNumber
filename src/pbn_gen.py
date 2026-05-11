@@ -15,6 +15,93 @@ import random
 random_state = None
 
 
+# ── 色彩稀有度保護工具 ──────────────────────────────────────────────
+# 用於四個殺點：cluster_colors / pruneClustersSimple / refine_region / merge_tiny_colors。
+# 共同原則：在 LAB 空間判斷顏色是否「彩度高且與其他色孤立」，孤立色一律豁免合併。
+
+def _rgb_to_lab(rgb_arr):
+    """RGB(0~255) → LAB float32，shape 不變。
+    輸入可以是 (N, 3) 或 (H, W, 3)。
+    """
+    arr = np.asarray(rgb_arr, dtype=np.uint8)
+    if arr.ndim == 2:
+        lab = cv2.cvtColor(arr.reshape(-1, 1, 3), cv2.COLOR_RGB2LAB)
+        return lab.reshape(-1, 3).astype(np.float32)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+
+def _lab_chroma(rgb_arr):
+    """RGB → LAB chroma √(a*²+b*²)，shape (N,)。
+    chroma 是 LAB 色相平面上離灰軸的距離，純色感越強值越大。
+    """
+    lab = _rgb_to_lab(rgb_arr)
+    flat = lab.reshape(-1, 3)
+    a = flat[:, 1] - 128.0  # OpenCV LAB: a,b ∈ [0,255]，128 為中性
+    b = flat[:, 2] - 128.0
+    return np.sqrt(a * a + b * b)
+
+
+def _is_chromatically_isolated(color_rgb, palette_rgb, min_lab_dist=25.0):
+    """LAB 空間中 color 與 palette 全體最近距離 > min_lab_dist → True。
+    palette_rgb 為空（或 None）時回傳 False（沒有比較對象，不算孤立）。
+    """
+    if palette_rgb is None or len(palette_rgb) == 0:
+        return False
+    c_lab = _rgb_to_lab(np.asarray(color_rgb, dtype=np.uint8).reshape(1, 3))[0]
+    p_lab = _rgb_to_lab(np.asarray(palette_rgb, dtype=np.uint8))
+    dists = np.linalg.norm(p_lab - c_lab, axis=1)
+    return float(dists.min()) > float(min_lab_dist)
+
+
+def _find_chromatic_pixels(image_rgb, chroma_min=28.0, count_min=20):
+    """找出高彩度像素 mask（shape: HxW bool）。
+    chroma_min: LAB chroma 門檻
+    count_min:  顏色在圖中出現的最少像素數，過濾單點雜訊（以「相同 RGB 值」計數，非連通元件）
+
+    回傳：bool mask，True 為高彩度且非雜訊。
+    """
+    h, w = image_rgb.shape[:2]
+    flat_rgb = image_rgb.reshape(-1, 3)
+    chroma = _lab_chroma(flat_rgb)
+    chrom_mask = chroma > float(chroma_min)
+    if not chrom_mask.any():
+        return np.zeros((h, w), dtype=bool)
+
+    # 過濾出現次數過少的顏色（雜訊），以 RGB 直接做頻次統計
+    # 用 24-bit packed key 做快速計數
+    packed = (flat_rgb[:, 0].astype(np.int64) << 16) \
+           | (flat_rgb[:, 1].astype(np.int64) << 8) \
+           | flat_rgb[:, 2].astype(np.int64)
+    chrom_packed = packed[chrom_mask]
+    if chrom_packed.size == 0:
+        return np.zeros((h, w), dtype=bool)
+    uniq, counts = np.unique(chrom_packed, return_counts=True)
+    valid_keys = set(uniq[counts >= int(count_min)].tolist())
+    if not valid_keys:
+        return np.zeros((h, w), dtype=bool)
+    valid_mask_flat = np.zeros_like(chrom_mask)
+    valid_mask_flat[chrom_mask] = np.isin(chrom_packed, list(valid_keys))
+    return valid_mask_flat.reshape(h, w)
+
+
+def _compute_saliency_map(image_rgb, radius_px=15):
+    """LAB 局部對比 saliency map：
+    每像素與其 (2*radius+1) 鄰域 LAB 平均色的歐氏距離。
+
+    回傳 (H, W) float32，值越大越「視覺顯著」。
+    優點：值是相對的——粉彩圖有粉彩級對比、螢光圖有螢光級對比，自動適配。
+
+    radius_px: 局部觀察半徑（建議 11~21），太小會放大雜訊，太大會稀釋小區
+    """
+    arr = np.asarray(image_rgb, dtype=np.uint8)
+    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ksize = max(3, int(radius_px) | 1)  # 確保奇數
+    local_mean = cv2.boxFilter(lab, ddepth=cv2.CV_32F, ksize=(ksize, ksize))
+    diff = lab - local_mean
+    return np.sqrt(np.sum(diff * diff, axis=2)).astype(np.float32)
+# ──────────────────────────────────────────────────────────────────
+
+
 class PbnGen:
     def __init__(
         self, f_name, num_colors=None, min_num_colors=10, pruningThreshold=6.25e-5, fixed_palette=None, suggestion_threshold=40
@@ -51,24 +138,67 @@ class PbnGen:
         )
         print(f"Quantized to {self.num_colors} colors")
 
-    def cluster_colors(self) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    def _is_component_salient(self, component_pixels_mask,
+                                min_fraction: float = 0.3,
+                                min_absolute: int = 3) -> bool:
+        """檢查連通元件是否整體「視覺顯著」。
+
+        component_pixels_mask: bool 或 0/1 array，shape 必須與 self._saliency_map 一致
+        min_fraction: 元件內超過 saliency threshold 的 pixel 比例下限（預設 30%）
+        min_absolute: 顯著 pixel 絕對數下限（預設 3）
+
+        兩條件 OR：「30% 以上 pixel 顯著」 OR 「至少 3 個 pixel 顯著」
+        前者抓大型焦點區，後者抓 ≤10 px 的細小焦點（如極小的眼睛中心）
+        避免「只碰到一條邊緣 pixel 就被誤判為顯著」造成過度保護
+        """
+        sal = getattr(self, '_saliency_map', None)
+        thresh = getattr(self, '_saliency_threshold', None)
+        if sal is None or thresh is None:
+            return False
+        comp = np.asarray(component_pixels_mask).astype(bool)
+        if comp.shape != sal.shape:
+            return False
+        if not comp.any():
+            return False
+        comp_size = int(comp.sum())
+        salient_count = int((sal[comp] > thresh).sum())
+        return (salient_count >= max(min_absolute, int(comp_size * min_fraction)))
+
+    def cluster_colors(self, sample_weight=None, saliency_flat=None,
+                       rescue_error_pct=85.0, rescue_sal_pct=80.0,
+                       rescue_min_pixels=50) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
         """
         Performs K means clustering on the image to quantize it to a fixed number of colors.
 
+        Arguments:
+            sample_weight: (H*W,) float array passed to sklearn KMeans.fit；None = 均勻
+            saliency_flat: (H*W,) float array，殘差救援用（None = 不做救援）
+            rescue_error_pct / rescue_sal_pct: 殘差救援雙條件 percentile 門檻
+            rescue_min_pixels: 救援像素數下限（少於此就不救援）
+
         Returns:
             (palette, labels, q_img)
-
-            palette: A (N, 3) numpy array representing the quantized colors in a float32 format.
-            labels: A (H*W,) numpy array which holds the assigned labels for each pixel in the image.
-            q_img: A (H, W, 3) quantized image which holds the original image quantized to the specified number of colors.
         """
 
         model = KMeans(
             n_clusters=self.num_colors, n_init="auto", random_state=random_state
         )
-        model.fit(self.img1d)
+        if sample_weight is not None:
+            model.fit(self.img1d, sample_weight=sample_weight)
+        else:
+            model.fit(self.img1d)
 
         centers = model.cluster_centers_
+
+        # 注意：先前嘗試的「殘差救援」（取代用量最低中心 → mini KMeans on
+        # 高誤差∩高顯著像素）反向咬到自己——高誤差像素 80%+ 是雜訊／邊界，
+        # mini KMeans 拿到的中心全是多數派棕色，反而把 saliency-weighted
+        # KMeans 辛苦保留的藍中心換成棕色。已移除；saliency-weighted KMeans
+        # 自己已足以保住小焦點區的色彩中心。
+        # (參數 rescue_error_pct / rescue_sal_pct / rescue_min_pixels 保留以維持簽名相容)
+        _ = (rescue_error_pct, rescue_sal_pct, rescue_min_pixels)  # 抑制 unused 警告
+        # ──────────────────────────────────────────────────────────
+
         snapped_centers = []
         self.color_suggestions = []
 
@@ -108,14 +238,37 @@ class PbnGen:
         q_img = self.palette[self.labels].reshape(self.image.shape)
         return self.palette, self.labels, q_img
 
-    def cluster_colors_(self):
+    def cluster_colors_(self, use_saliency=False, saliency_radius_px=15,
+                         saliency_weight_alpha=3.0, saliency_threshold_pct=80.0):
         """
-        An in-place clustering of colors, replaces existing image with the quantized version
-        """
+        In-place clustering of colors, replaces existing image with the quantized version.
 
-        colors, labels, q_img = self.cluster_colors()
+        use_saliency=True 時：
+          1. 計算 LAB 局部對比 saliency map（每像素 vs 鄰域平均）
+          2. KMeans 用 sample_weight = 1 + saliency × alpha 加權
+          3. 殘差救援：找量化誤差高 ∩ 顯著度高的像素，加新中心
+          4. saliency map 與 percentile 門檻存到 self._saliency_map / self._saliency_threshold
+             供下游 pruning / merge 階段用
+        """
+        sample_weight = None
+        saliency_flat = None
+        if use_saliency:
+            # 重要：當前 self.image 在 set_final_pbn 已被 resize 0.5x，
+            # 所以這裡計算的 saliency 與 self.img1d 對應，shape 一致
+            sal = _compute_saliency_map(self.image, radius_px=saliency_radius_px)
+            saliency_flat = sal.flatten().astype(np.float32)
+            sample_weight = 1.0 + saliency_flat * float(saliency_weight_alpha)
+            self._saliency_map = sal
+            self._saliency_threshold = float(np.percentile(saliency_flat, saliency_threshold_pct))
+            print(f"  → saliency: shape={sal.shape}, threshold(p{saliency_threshold_pct:.0f})={self._saliency_threshold:.2f}")
+        else:
+            self._saliency_map = None
+            self._saliency_threshold = None
+
+        colors, labels, q_img = self.cluster_colors(
+            sample_weight=sample_weight, saliency_flat=saliency_flat
+        )
         q_img = (q_img * 255).astype(np.uint8)
-        # print(q_img.dtype)
 
         if self.color_suggestions:
             print(f"[!] 提醒：發現 {len(self.color_suggestions)} 個區域色差較大，建議增加色系：", self.color_suggestions)
@@ -741,6 +894,7 @@ class PbnGen:
                 ), plt.show()
 
             # print('Starting pruning loop')
+            sal_protected_total = 0
             for color, labelMask in prunableClusters.items():
                 color = np.array(color, dtype=np.uint8)
 
@@ -751,6 +905,24 @@ class PbnGen:
                 # If no unique labels are detected, continue to the next color
                 if uniqueLabels.shape[0] == 0:
                     continue
+
+                # ── saliency 豁免：含視覺顯著像素的小連通元件跳過 prune ──
+                # _saliency_map 在 cluster_colors_ 設定；若 None 等同未啟用，無影響
+                if getattr(self, '_saliency_map', None) is not None \
+                        and self._saliency_threshold is not None \
+                        and self._saliency_map.shape == labelMask.shape:
+                    keep = []
+                    for lbl in uniqueLabels:
+                        comp_mask = (labelMask == lbl)
+                        if self._is_component_salient(comp_mask):
+                            sal_protected_total += 1
+                        else:
+                            keep.append(lbl)
+                    uniqueLabels = np.array(keep, dtype=uniqueLabels.dtype) \
+                                   if keep else np.array([], dtype=uniqueLabels.dtype)
+                    if uniqueLabels.shape[0] == 0:
+                        continue
+                # ─────────────────────────────────────────────────────
 
                 if trySlow:
                     # A much slower iterative version of cluster pruning
@@ -787,9 +959,11 @@ class PbnGen:
                     for label, index in consistentIndexingMap.items():
                         consistentLabelMask[labelMask == label] = index
 
-                    # Apply the mapping only to non-zero labels
-                    image[labelMask != 0] = surroundingColors[
-                        consistentLabelMask[labelMask != 0]
+                    # Apply mapping only to labels we actually want to prune
+                    # （uniqueLabels 可能因 saliency 豁免被縮減）
+                    prune_pix_mask = np.isin(labelMask, uniqueLabels)
+                    image[prune_pix_mask] = surroundingColors[
+                        consistentLabelMask[prune_pix_mask]
                     ]
 
             if showPlots:
@@ -805,6 +979,8 @@ class PbnGen:
                 ), plt.title("Diff"), plt.show()
 
             self.setImage(image.astype(np.uint8))
+            if sal_protected_total > 0:
+                print(f"\n  → saliency 豁免 {sal_protected_total} 個小元件免被 prune")
 
         print("\nDone!")
 
@@ -882,14 +1058,21 @@ class PbnGen:
         outlier_mask = distances > threshold
 
         # 亮度保護：LAB L* > 78 的像素（眼白、高光）強制加入
+        # 並聯彩度保護：LAB chroma > 28 的像素（眼睛藍、唇紅等飽和細節）強制加入
         lab_pixels = cv2.cvtColor(
             region_pixels.astype(np.uint8).reshape(-1, 1, 3),
             cv2.COLOR_RGB2LAB
         ).reshape(-1, 3).astype(np.float32)
         bright_mask = lab_pixels[:, 0] > 200
-        outlier_mask = outlier_mask | bright_mask
+        a_ch = lab_pixels[:, 1] - 128.0
+        b_ch = lab_pixels[:, 2] - 128.0
+        chroma_pixel = np.sqrt(a_ch * a_ch + b_ch * b_ch)
+        chroma_mask = chroma_pixel > 28.0
+        outlier_mask = outlier_mask | bright_mask | chroma_mask
         if bright_mask.sum() > 0:
             print(f"  → 亮度保護：{int(bright_mask.sum())} 個高亮像素（眼白/高光）")
+        if chroma_mask.sum() > 0:
+            print(f"  → 彩度保護：{int(chroma_mask.sum())} 個高飽和像素（眼睛藍/唇紅）")
 
         if outlier_mask.sum() >= 10:
             outlier_pixels = region_pixels_f[outlier_mask]
@@ -928,10 +1111,16 @@ class PbnGen:
 
         if len(tiny_colors) > 0:
             merged = 0
+            saved_iso = 0
             # 建立「有效顏色」集合（排除微小色）
             valid_colors = unique_colors[counts >= min_pixels].astype(np.float32)
             if len(valid_colors) > 0:
                 for tc in tiny_colors:
+                    # chromatic isolation 豁免：若 tc 在 LAB 中與所有 valid_colors 距離 > 25
+                    # → 視為「真正獨特的視覺焦點色」，不合併
+                    if _is_chromatically_isolated(tc, valid_colors.astype(np.uint8), min_lab_dist=25.0):
+                        saved_iso += 1
+                        continue
                     tc_f = tc.astype(np.float32)
                     # 找最近的有效顏色
                     dists = np.linalg.norm(valid_colors - tc_f, axis=1)
@@ -941,6 +1130,8 @@ class PbnGen:
                     new_colors[match] = nearest_valid
                     merged += match.sum()
                 print(f"  → 微小色塊合併：{len(tiny_colors)} 色 / {merged} 像素 併入鄰近色")
+                if saved_iso > 0:
+                    print(f"  → chromatic isolation 豁免 {saved_iso} 色（LAB 距離 > 25 視為視覺焦點）")
         # ──────────────────────────────────────────────────────────────
 
         # 寫回影像
@@ -951,14 +1142,17 @@ class PbnGen:
 
     def merge_tiny_colors(self, min_radius_px: float,
                           exclude_mask: np.ndarray = None,
-                          fg_radius_scale: float = 0.5):
+                          fg_radius_scale: float = 0.5,
+                          saliency_floor_scale: float = 0.3):
         """
         小色塊合併：基於幾何可繪性（最大內切圓半徑）。
         每個連通元件獨立判斷——只要最大內切圓半徑 < min_radius_px 就合併。
 
-        min_radius_px:   最小可下筆半徑（像素），由畫布尺寸換算（0.1cm）
-        exclude_mask:    SAM 遮罩（遮罩內用 fg_radius_scale 縮小門檻保留細節）
-        fg_radius_scale: 遮罩內門檻倍率（預設 0.5 = 允許更細小的色塊）
+        min_radius_px:        最小可下筆半徑（像素），由畫布尺寸換算
+        exclude_mask:         SAM 遮罩（遮罩內用 fg_radius_scale 縮小門檻保留細節）
+        fg_radius_scale:      遮罩內門檻倍率（預設 0.5 = 允許更細小的色塊）
+        saliency_floor_scale: 視覺顯著元件的最低物理底線倍率（預設 0.3）
+                              再小於這個就是「印出來無法塗」，無論多顯著一律合併
         """
         img = self.getImage().astype(np.uint8)
         h, w = img.shape[:2]
@@ -979,6 +1173,7 @@ class PbnGen:
         # tiny_list: [(color_tuple, y0,y1,x0,x1, label_id)] 待合併元件的定位資訊
         surviving_colors = set()
         tiny_list = []  # (color_tuple, label_map, label_id) — label_map 是小區域的
+        sal_saved = 0   # saliency 救回的元件數
 
         for color in unique_colors:
             color_key = tuple(int(v) for v in color)
@@ -1004,6 +1199,15 @@ class PbnGen:
                 if max_r >= threshold:
                     color_has_survivor = True
                 else:
+                    # ── saliency 豁免：顯著元件 + 大於物理底線 → 保留
+                    # 構建全圖座標的 component mask，呼叫 _is_component_salient
+                    floor = min_radius_px * saliency_floor_scale
+                    if max_r >= floor:
+                        full_comp = (labels == label_id)
+                        if self._is_component_salient(full_comp):
+                            color_has_survivor = True
+                            sal_saved += 1
+                            continue
                     tiny_list.append((color_key, y0, y1, x0, x1, label_id))
             if color_has_survivor:
                 surviving_colors.add(color_key)
@@ -1035,6 +1239,9 @@ class PbnGen:
         self.setImage(result)
         print(f"  → 小色塊合併：{merged_blocks} 個色塊 / {merged_pixels} px"
               f"（幾何門檻 r>={min_radius_px:.1f}px，fg 縮小至 {min_radius_px * fg_radius_scale:.1f}px）")
+        if sal_saved > 0:
+            print(f"  → saliency 豁免 {sal_saved} 個元件免被合併"
+                  f"（物理底線 r>={min_radius_px * saliency_floor_scale:.1f}px）")
 
     def apply_weighted_region(self, mask: np.ndarray, total_colors: int,
                                weight_ratio: float = 0.65,
@@ -1109,21 +1316,36 @@ class PbnGen:
         self.setImage(result.astype(np.uint8))
         print(f"[OK] weighted_region 完成")
 
-    def set_final_pbn(self, blur_ksize=21, blur_sigma_color=21, blur_sigma_space=14, prune_iterations=6):
+    def set_final_pbn(self, blur_ksize=21, blur_sigma_color=21, blur_sigma_space=14,
+                       prune_iterations=6, use_saliency=False, saliency_radius_px=15,
+                       saliency_weight_alpha=3.0, saliency_threshold_pct=80.0):
         """
         Runs all necessary functions to get the final paint by number image.
         細緻度由外部參數控制：
           blur_ksize/sigma: 越大越模糊（色塊越大越簡單）
           prune_iterations: 越多小色塊越少（越簡單）
           pruningThreshold 在 __init__ 設定
+          use_saliency=True: 啟用影像自適應顯著度保護（推薦）
         """
-        originalDims = self.getImage().shape[:-1]
+        originalDims = self.getImage().shape[:-1]   # (H, W)
         self.blurImage_(blurType="bilateral", ksize=blur_ksize,
                         sigmaColor=blur_sigma_color, sigmaSpace=blur_sigma_space)
         self.resizeImage_(0.5)
-        self.cluster_colors_()
+        self.cluster_colors_(
+            use_saliency=use_saliency,
+            saliency_radius_px=saliency_radius_px,
+            saliency_weight_alpha=saliency_weight_alpha,
+            saliency_threshold_pct=saliency_threshold_pct,
+        )
         self.pruneClustersSimple(iterations=prune_iterations)
         self.resizeImage_(dimension=originalDims)
+
+        # cluster_colors_ 在 0.5x 解析度計算 saliency，這裡 upsample 回原始大小供下游用
+        if use_saliency and getattr(self, '_saliency_map', None) is not None:
+            self._saliency_map = cv2.resize(
+                self._saliency_map, (originalDims[1], originalDims[0]),
+                interpolation=cv2.INTER_LINEAR
+            )
 
     @staticmethod
     def _contour_to_bezier_path(contour, tension: float = 0.3) -> str:
@@ -1184,12 +1406,19 @@ class PbnGen:
         return snapped, smoothed_masks
 
     @staticmethod
-    def _merge_small_regions(snapped_rgb: np.ndarray, min_width_px: float) -> np.ndarray:
+    def _merge_small_regions(snapped_rgb: np.ndarray, min_width_px: float,
+                              saliency_map: np.ndarray = None,
+                              saliency_threshold: float = None,
+                              saliency_floor_scale: float = 0.5) -> np.ndarray:
         """
         消除小碎片：同時滿足以下兩個條件才合併：
           1. 面積 < (min_width_px * 2)^2（約一個 0.4cm×0.4cm 的正方形）
           2. distanceTransform 最大值 * 2 < min_width_px（最大可畫寬度 < 0.2cm）
-        反覆執行直到沒有符合條件的碎片為止。
+
+        saliency_map / saliency_threshold:
+          若提供，視覺顯著元件可豁免合併（前提是仍滿足下方物理底線）
+        saliency_floor_scale:
+          顯著元件的物理底線倍率（預設 0.5）。max_radius < min_width_px/2 * scale 仍合
         """
         h, w = snapped_rgb.shape[:2]
         palette = np.unique(snapped_rgb.reshape(-1, 3), axis=0)  # (N, 3) uint8
@@ -1199,6 +1428,10 @@ class PbnGen:
         area_threshold = int((min_width_px * 2) ** 2)
         # 寬度門檻：inscribed circle 半徑 < 0.1cm（直徑 < 0.2cm）
         radius_threshold = min_width_px / 2.0
+        # 顯著元件的物理底線（即使顯著，太細仍合）
+        salient_floor = radius_threshold * float(saliency_floor_scale)
+        use_saliency = (saliency_map is not None and saliency_threshold is not None
+                        and saliency_map.shape == (h, w))
 
         # 建立顏色索引圖（每個像素 → palette index）
         label_img = np.zeros((h, w), dtype=np.int32)
@@ -1206,6 +1439,7 @@ class PbnGen:
             label_img[np.all(snapped_rgb == c, axis=2)] = ci
 
         dilate_kernel = np.ones((3, 3), dtype=np.uint8)
+        sal_saved = 0
         changed = True
         while changed:
             changed = False
@@ -1225,6 +1459,11 @@ class PbnGen:
                     max_radius = float(dist.max())
                     if max_radius >= radius_threshold:
                         continue
+                    # saliency 豁免：顯著元件 + 大於物理底線 → 保留
+                    if use_saliency and max_radius >= salient_floor:
+                        if saliency_map[comp_mask].max() > saliency_threshold:
+                            sal_saved += 1
+                            continue
                     # 找邊界相鄰像素的顏色，合併到最多的鄰居
                     dilated = cv2.dilate(comp_mask.astype(np.uint8), dilate_kernel) > 0
                     border = dilated & ~comp_mask
@@ -1236,6 +1475,9 @@ class PbnGen:
                     best_ci = int(np.argmax(counts))
                     label_img[comp_mask] = best_ci
                     changed = True
+
+        if sal_saved > 0:
+            print(f"  → _merge_small_regions saliency 豁免 {sal_saved} 個碎片（底線 r>={salient_floor:.1f}px）")
 
         # 重建 RGB 圖
         result = palette[label_img].astype(np.uint8)
@@ -1362,7 +1604,12 @@ class PbnGen:
         )
         # 消除小碎片：寬度 < 0.2cm 且面積夠小的連通區域，合併到鄰近顏色
         # min_font_px 即 0.2cm 對應的像素數，作為寬度門檻
-        snapped_rgb = self._merge_small_regions(snapped_rgb, min_font_px)
+        # saliency 顯著元件可豁免（含物理底線檢查），保留視覺焦點
+        snapped_rgb = self._merge_small_regions(
+            snapped_rgb, min_font_px,
+            saliency_map=getattr(self, '_saliency_map', None),
+            saliency_threshold=getattr(self, '_saliency_threshold', None),
+        )
         # 重新建立 smoothed_masks（與合併後的 snapped_rgb 對齊）
         smoothed_masks = {}
         for color_key in color_masks.keys():

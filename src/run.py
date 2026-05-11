@@ -37,6 +37,13 @@ WEIGHT_RATIO  = 0.65  # 選取區佔總色數比例（0.5~0.8）
 # 手動指定範例：[(30, 45), (40, 60), (50, 75)]
 CANVAS_SIZES_CM   = None
 MIN_BRUSH_DIAM_CM = 1  # 最小可塗色塊直徑（公分），建議 1.0~2.0
+
+# 影像自適應顯著度保護（解決「眼睛被吃掉」這類小高彩度細節遺失問題）
+# 推薦保持 True；圖片自身的局部對比決定保護強度，無寫死門檻
+USE_SALIENCY            = True
+SALIENCY_RADIUS_PX      = 15   # 局部對比觀察半徑，建議 11~21
+SALIENCY_WEIGHT_ALPHA   = 3.0  # KMeans sample_weight = 1 + sal × α
+SALIENCY_THRESHOLD_PCT  = 80   # 顯著度 percentile 門檻（下游 prune/merge 豁免）
 # ────────────────────────────────────────────────────────
 
 IMAGES_DIR     = r"D:\website\PaintLearn\paint-by-number\images"
@@ -275,6 +282,10 @@ def run_single_level(input_image_path, level_dir, level, mode, sam_mask,
             blur_sigma_color=level["blur_sigma_color"],
             blur_sigma_space=level["blur_sigma_space"],
             prune_iterations=level["prune_iterations"],
+            use_saliency=USE_SALIENCY,
+            saliency_radius_px=SALIENCY_RADIUS_PX,
+            saliency_weight_alpha=SALIENCY_WEIGHT_ALPHA,
+            saliency_threshold_pct=SALIENCY_THRESHOLD_PCT,
         )
         if mode == "sam_refine" and sam_mask_cropped is not None:
             extra_colors = level.get("refine_extra_colors", EXTRA_COLORS)
